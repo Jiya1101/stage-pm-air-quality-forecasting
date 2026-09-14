@@ -64,9 +64,10 @@ environment doesn't have. So:
   the architecture actually learns transport lag and stability gating before any
   real data is available.
 - The **real data-source clients** (`src/aqf/data/cpcb.py`, `era5.py`,
-  `firms.py`) are implemented against their real APIs but need you to supply
-  credentials (see "Connecting real data" below). Swapping synthetic → real data
-  requires no model changes — both produce the same `RawSeries` schema.
+  `firms.py`, `openaq.py`, `opencity.py`) are implemented against their real
+  APIs but need you to supply credentials (see "Connecting real data" below).
+  Swapping synthetic → real data requires no model changes — both produce the
+  same `RawSeries` schema.
 
 ## Quickstart
 
@@ -80,14 +81,25 @@ python scripts/evaluate.py --checkpoint runs/full/best.pt
 
 ## Connecting real data
 
-| Source | What you need | Where |
-|---|---|---|
-| CPCB / CAAQMS | `data.gov.in` API key (free registration) | [src/aqf/data/cpcb.py](src/aqf/data/cpcb.py) |
-| ERA5 (BLH, wind, inversion, RH, radiation) | Copernicus CDS API key (`~/.cdsapirc`) | [src/aqf/data/era5.py](src/aqf/data/era5.py) |
-| NASA FIRMS (VIIRS fire detections) | FIRMS MAP_KEY (free) | [src/aqf/data/firms.py](src/aqf/data/firms.py) |
+| Source | Gives us | What you need | Where |
+|---|---|---|---|
+| **OpenAQ** | Multi-pollutant concentrations (PM2.5/PM10/NO2/CO/O3 in real ug/m3) + met variables for ~35 Delhi CAAQMS stations back to ~2018 | Free API key at [explore.openaq.org/register](https://explore.openaq.org/register) | [src/aqf/data/openaq.py](src/aqf/data/openaq.py) |
+| **data.opencity.in** | Composite hourly AQI, 2017-2023, exact match to all 15 `LOCAL_STATIONS` | **Nothing** — no key, no login | [src/aqf/data/opencity.py](src/aqf/data/opencity.py) |
+| ERA5 (BLH, wind, inversion, RH, radiation) | The atmospheric-stability inputs the transport graph depends on | Copernicus CDS API key (`~/.cdsapirc`) | [src/aqf/data/era5.py](src/aqf/data/era5.py) |
+| NASA FIRMS | VIIRS fire detections for the Fire Emission Proxy | FIRMS MAP_KEY (free) | [src/aqf/data/firms.py](src/aqf/data/firms.py) |
+| CPCB / data.gov.in | Live current-snapshot AQI only (not a historical archive — see cpcb.py docstring) | `data.gov.in` API key (now via MeriPehchaan SSO) | [src/aqf/data/cpcb.py](src/aqf/data/cpcb.py) |
 
-Set the keys via environment variables (`CPCB_API_KEY`, `CDS_API_KEY`,
-`FIRMS_MAP_KEY`) or the `.cdsapirc` file CDS expects, then set
+**OpenAQ is the primary historical source** for the actual pollutant
+concentrations the physics-constrained loss needs (mass conservation needs
+real ug/m3, not an index). **opencity.in needs zero registration** and is
+useful immediately as a free secondary/cross-check feature via
+`opencity.approximate_pm25_from_aqi()` (inverts CPCB's official AQI
+breakpoint table — an estimate, not ground truth, see that module's
+docstring). data.gov.in's CPCB API turned out to only serve live snapshots,
+not a multi-year archive, so it's optional/supplementary here, not primary.
+
+Set the keys via environment variables (`OPENAQ_API_KEY`, `CPCB_API_KEY`,
+`CDS_API_KEY`, `FIRMS_MAP_KEY`) or the `.cdsapirc` file CDS expects, then set
 `config.data.source = "real"` instead of `"synthetic"`.
 
 ## Project layout
@@ -96,7 +108,7 @@ Set the keys via environment variables (`CPCB_API_KEY`, `CDS_API_KEY`,
 src/aqf/
   features/     stability index, transport lag, fire emission proxy
   graph/        station registry, multi-scale graph builder (G_L, G_R, G_A)
-  data/         cpcb.py, era5.py, firms.py (real), synthetic.py (simulator), dataset.py (windowing)
+  data/         openaq.py, opencity.py, cpcb.py, era5.py, firms.py (real), synthetic.py (simulator), dataset.py (windowing)
   models/       encoders, physics-constrained operator, temporal transformer, multi-task heads, stage_pm.py
   losses/       physics-constrained regularization loss
   training/     train.py, ablation.py (experiments A-H)

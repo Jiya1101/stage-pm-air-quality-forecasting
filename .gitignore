@@ -3,9 +3,10 @@ __pycache__/
 .venv/
 venv/
 
-# generated data and model artifacts — regenerate via scripts/generate_synthetic_data.py
-data/
-runs/
+# generated data and model artifacts (top-level only — NOT src/aqf/data/, which is source code)
+# regenerate via scripts/generate_synthetic_data.py
+/data/
+/runs/
 
 # real-data credentials, never commit
 .cdsapirc
