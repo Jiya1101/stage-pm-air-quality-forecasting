@@ -3,14 +3,7 @@
 Physics-constrained, source-aware, multi-scale dynamic transport graph network for
 PM2.5 forecasting in Delhi-NCR.
 
-This implements the **STAGE-PM** architecture (Source → Transport → Atmospheric
-stability → Graph → Explainable operator) as scoped in
-[`docs/DrPriyaVSuggestions.pdf`](docs) and cross-referenced against the 15
-foundational papers summarized in `docs/AirQualityForecastingResearchPapers.pdf`.
-The core idea: don't model PM2.5 as station-to-station correlation. Model it as a
-**source → transport → stability-controlled dispersion → receptor accumulation**
-physical process, with a GNN as the learned implementation of that process, not the
-invention itself.
+
 
 ## Why this is not "just another STGNN"
 
