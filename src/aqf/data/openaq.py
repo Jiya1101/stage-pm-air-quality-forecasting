@@ -59,12 +59,19 @@ class OpenAQClient:
     def get_hourly_measurements(
         self, sensor_id: int, date_from: str, date_to: str, limit: int = 1000, sleep_s: float = 0.25
     ) -> pd.DataFrame:
-        """Paginate through hourly-aggregated measurements for one sensor over [date_from, date_to] (YYYY-MM-DD)."""
+        """Paginate through hourly-aggregated measurements for one sensor over [date_from, date_to] (YYYY-MM-DD).
+
+        NOTE: verified live against the OpenAPI spec -- this endpoint's date
+        filter params are `datetime_from`/`datetime_to`, NOT `date_from`/
+        `date_to` (which are silently ignored, so an unfiltered call pulls
+        the sensor's *entire* history -- caught this during testing when a
+        10-day request took minutes instead of seconds).
+        """
         rows, page = [], 1
         while True:
             payload = self._get(
-                f"/sensors/{sensor_id}/measurements_hourly",
-                {"date_from": date_from, "date_to": date_to, "limit": limit, "page": page},
+                f"/sensors/{sensor_id}/measurements/hourly",
+                {"datetime_from": date_from, "datetime_to": date_to, "limit": limit, "page": page},
             )
             results = payload.get("results", [])
             if not results:
@@ -89,22 +96,46 @@ class OpenAQClient:
         return df
 
     def fetch_station_history(self, location_id: int, date_from: str, date_to: str) -> pd.DataFrame:
-        """All target parameters for one location over a date range, wide format (one column per parameter)."""
+        """All target parameters for one location over a date range, wide format (one column per parameter).
+
+        Some locations expose more than one sensor for the same parameter
+        (verified live: duplicate/re-registered instrument entries, sometimes
+        in different units -- e.g. co/no2 in ppb on one sensor, ug/m3 on
+        another). This takes the first sensor encountered per parameter and
+        skips the rest, to avoid duplicate-named columns; it does not attempt
+        unit harmonization across sensors -- check `units_used` if precise
+        units matter downstream.
+        """
         sensors = self.get_sensors(location_id)
         frames = []
+        seen_params: set[str] = set()
+        units_used: dict[str, str] = {}
         for sensor in sensors:
             param_name = sensor.get("parameter", {}).get("name")
-            if param_name not in TARGET_PARAMETERS:
+            if param_name not in TARGET_PARAMETERS or param_name in seen_params:
                 continue
             df = self.get_hourly_measurements(sensor["id"], date_from, date_to)
             if df.empty:
                 continue
+            seen_params.add(param_name)
+            units_used[param_name] = sensor.get("parameter", {}).get("units", "")
             df = df.rename(columns={"value": param_name})[["datetime", param_name]]
             frames.append(df.set_index("datetime"))
         if not frames:
-            return pd.DataFrame()
-        wide = pd.concat(frames, axis=1)
-        return wide.sort_index().reset_index()
+            result = pd.DataFrame()
+        else:
+            wide = pd.concat(frames, axis=1)
+            result = wide.sort_index().reset_index()
+        result.attrs["units_used"] = units_used
+        return result
+
+
+# Verified live against the OpenAQ v3 API: a handful of graph/stations.py names don't match
+# verbatim (a hyphen difference, same issue as data/opencity.py's STATION_NAME_OVERRIDES).
+STATION_NAME_OVERRIDES = {
+    "Dwarka Sector 8": "Dwarka-Sector 8",
+    "Okhla Phase 2": "Okhla Phase-2",
+}
 
 
 def match_local_stations_to_openaq(client: OpenAQClient) -> dict[str, dict]:
@@ -113,14 +144,16 @@ def match_local_stations_to_openaq(client: OpenAQClient) -> dict[str, dict]:
     Returns {station_id: openaq_location_dict}. Matches are by substring on
     station name -- verify manually before relying on this for a full
     pipeline run, since OpenAQ station naming doesn't always exactly mirror
-    CPCB's station names.
+    CPCB's station names, and a couple of stations (verified live) have more
+    than one OpenAQ location id (old + re-registered entries); this picks
+    the first and isn't guaranteed stable across OpenAQ-side changes.
     """
     from aqf.graph.stations import LOCAL_STATIONS
 
     locations = client.find_locations()
     matches = {}
     for station in LOCAL_STATIONS:
-        name_l = station.name.lower()
+        name_l = STATION_NAME_OVERRIDES.get(station.name, station.name).lower()
         candidates = [loc for loc in locations if name_l in loc.get("name", "").lower() or loc.get("name", "").lower() in name_l]
         if candidates:
             matches[station.id] = candidates[0]
