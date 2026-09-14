@@ -54,7 +54,20 @@ class OpenAQClient:
             if elapsed < self.min_interval_s:
                 time.sleep(self.min_interval_s - elapsed)
 
-            resp = self._session.get(f"{BASE_URL}{path}", params=params, timeout=self.timeout)
+            try:
+                resp = self._session.get(f"{BASE_URL}{path}", params=params, timeout=self.timeout)
+            except requests.exceptions.RequestException as e:
+                # Transient network blip -- observed live, twice, during a multi-minute, many-request
+                # fetch: once as ConnectionError on the initial connect, once as ChunkedEncodingError
+                # while requests was reading the response body (both wrap the same underlying
+                # ConnectionResetError, but requests surfaces them as different exception subclasses,
+                # so catch RequestException broadly rather than trying to enumerate every variant).
+                self._last_request_t = time.time()
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(min((2 ** attempt) * 2, 30.0))
+                continue
+
             self._last_request_t = time.time()
 
             if resp.status_code == 429:
@@ -73,7 +86,7 @@ class OpenAQClient:
             resp.raise_for_status()
             return resp.json()
 
-        raise RuntimeError(f"OpenAQ API: gave up after {max_retries} retries on 429 for {path}")
+        raise RuntimeError(f"OpenAQ API: gave up after {max_retries} retries (429 / connection errors) for {path}")
 
     def find_locations(self, bbox: tuple[float, float, float, float] = NCR_BBOX, limit: int = 100) -> list[dict]:
         """List ALL monitoring locations within `bbox` (west, south, east, north), paginated.

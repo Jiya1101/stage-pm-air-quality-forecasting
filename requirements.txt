@@ -6,5 +6,7 @@ requests>=2.31
 matplotlib>=3.8
 python-dotenv>=1.0
 
-# Optional, only needed for real-data ingestion:
-# cdsapi>=0.6        # ERA5 (src/aqf/data/era5.py)
+# Optional, only needed for real ERA5 ingestion (src/aqf/data/era5.py):
+cdsapi>=0.7.7
+xarray>=2024.1
+netCDF4>=1.6

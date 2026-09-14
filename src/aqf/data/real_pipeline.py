@@ -9,23 +9,27 @@ or care whether the numbers came from the simulator or from here.
 What's real right now vs. placeholder, and why:
 
   REAL (from live, verified APIs):
-    - local pm25, pm10, no2, co, o3, temp, RH, wind  <- OpenAQ (data/openaq.py)
-    - regional fire activity (Fire Emission Proxy)    <- FIRMS (data/firms.py, features/fire_proxy.py)
+    - local pm25, pm10, no2, co, o3, temp, RH, wind      <- OpenAQ (data/openaq.py)
+    - regional fire activity (Fire Emission Proxy)        <- FIRMS (data/firms.py, features/fire_proxy.py)
+    - domain atmos: BLH, inversion strength, RH, wind
+      speed, solar radiation, pressure, precip            <- ERA5 (data/era5.py), when `use_era5=True`
+      (default) and ~/.cdsapirc is configured -- this is
+      the core physics input (continuous stability index),
+      verified live: BLH ~600-735m over Delhi at noon in
+      August, physically correct for that season.
+    - regional (Punjab/Haryana/Rajasthan/W-UP) wind        <- ERA5, nearest-neighbor per source centroid
 
-  PLACEHOLDER (until ERA5 is wired in -- see data/era5.py):
-    - atmospheric BLH, inversion strength, solar radiation, pressure, precip
-      -- these fundamentally require ERA5 reanalysis; ground stations don't
-      measure boundary-layer height. Filled with a documented diurnal
-      climatology, NOT real data -- the stability index computed from these
-      will be a rough proxy, not the real physics, until ERA5 is added.
-    - regional (Punjab/Haryana/Rajasthan/W-UP) wind vectors and
-      industry/dust indices -- OpenAQ station density is sparse outside
-      Delhi, so these fall back to the same climatology. FIRMS gives fire
-      location/intensity, not wind.
+  PLACEHOLDER (no free real-data source identified yet):
+    - regional industry_index, dust_index -- constants.
+      A real industrial-activity or satellite-AOD proxy
+      would replace these; out of scope for now.
+    - local traffic_index -- diurnal heuristic; no free
+      real-time traffic-count API wired in.
 
-Once ERA5 access is set up, replace `_placeholder_atmos()` and
-`_placeholder_regional_met()` with real pulls (era5.py already has the
-retrieval + NetCDF-extraction code) -- the RawSeries shape does not change.
+If ERA5 isn't configured (cdsapi/xarray missing, ~/.cdsapirc absent, or a
+CDS request fails for any reason -- license not accepted, etc.),
+assemble_real_raw_series() catches it, warns, and falls back to the
+documented diurnal-climatology placeholder so the pipeline still runs.
 """
 from __future__ import annotations
 
@@ -96,6 +100,47 @@ def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = Non
     return fire_emission_proxy(raw, region_col="region_id", time_col="acq_datetime", frp_col="frp_mw")
 
 
+ERA5_DOMAIN_AREA = (32.5, 73.0, 24.0, 79.5)  # (north, west, south, east) -- same NCR transport domain as FIRMS
+
+_era5_scratch_dir = "data/real/.era5_cache"
+
+
+def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Real ERA5 pull: domain-averaged atmos series + per-REGIONAL_SOURCES wind.
+
+    Two CDS requests (single-levels for BLH/wind/RH/solar/pressure/precip,
+    pressure-levels@925hPa for inversion strength), each queued server-side
+    -- expect this to take a few minutes even for a short date range (~1 min
+    was observed for a single-hour test pull). Downloads are cached to
+    `cache_dir` so re-running doesn't re-submit the same CDS request.
+    """
+    import os
+
+    from aqf.data.era5 import (
+        build_domain_atmos_series,
+        download_era5,
+        download_era5_pressure_level,
+        extract_point_wind_series,
+    )
+
+    os.makedirs(cache_dir, exist_ok=True)
+    single_path = os.path.join(cache_dir, f"single_{date_from}_{date_to}.nc")
+    pressure_path = os.path.join(cache_dir, f"pressure925_{date_from}_{date_to}.nc")
+
+    if not os.path.exists(single_path):
+        download_era5(single_path, ERA5_DOMAIN_AREA, date_from, date_to)
+    if not os.path.exists(pressure_path):
+        download_era5_pressure_level(pressure_path, ERA5_DOMAIN_AREA, date_from, date_to)
+
+    atmos_df = build_domain_atmos_series(single_path, pressure_path)
+
+    regional_wind = {}
+    for source in REGIONAL_SOURCES:
+        regional_wind[source.id] = extract_point_wind_series(single_path, source.lat, source.lon)
+
+    return atmos_df, regional_wind
+
+
 def _placeholder_atmos(index: pd.DatetimeIndex) -> np.ndarray:
     """Diurnal-climatology placeholder for BLH/inversion/solar/pressure/precip, pending ERA5.
 
@@ -121,8 +166,16 @@ def assemble_real_raw_series(
     date_to: str,
     openaq_api_key: str | None = None,
     firms_map_key: str | None = None,
+    use_era5: bool = True,
 ) -> RawSeries:
-    """Build a RawSeries from live OpenAQ + FIRMS data. See module docstring for what's real vs placeholder."""
+    """Build a RawSeries from live OpenAQ + FIRMS (+ ERA5 if available) data.
+
+    See module docstring for what's real vs placeholder. `use_era5=True`
+    (default) tries a real ERA5 pull for atmos + regional wind and falls
+    back to the documented placeholder climatology with a warning if
+    cdsapi/xarray aren't installed or ~/.cdsapirc isn't configured -- so
+    this function still works end-to-end without ERA5 access.
+    """
     index = _hourly_index(date_from, date_to)
     T, N_local, N_reg = len(index), len(LOCAL_STATIONS), len(REGIONAL_SOURCES)
 
@@ -157,13 +210,37 @@ def assemble_real_raw_series(
         for j, source in enumerate(REGIONAL_SOURCES):
             if source.id in regional_fep.columns:
                 regional[:, j, 0] = np.nan_to_num(regional_fep[source.id].to_numpy())
-    # regional wind/industry/dust: placeholder until ERA5 / a proper industrial-activity proxy is wired in.
-    regional[:, :, 1] = 0.0   # wind_u_ms placeholder
-    regional[:, :, 2] = -2.0  # wind_v_ms placeholder (slight northerly, i.e. toward Delhi -- a guess, not data)
+    # industry/dust index: no free real-data source wired in yet -- placeholder either way.
     regional[:, :, 3] = 15.0  # industry_index placeholder
     regional[:, :, 4] = 5.0   # dust_index placeholder
 
-    atmos = _placeholder_atmos(index).astype(np.float32)
+    atmos_df, regional_wind = None, None
+    if use_era5:
+        try:
+            atmos_df, regional_wind = fetch_era5(date_from, date_to)
+        except Exception as e:  # cdsapi/xarray missing, ~/.cdsapirc not set up, license not accepted, etc.
+            warnings.warn(f"ERA5 fetch failed ({e!r}) -- falling back to placeholder atmos/regional-wind data.")
+
+    if atmos_df is not None:
+        atmos_df = atmos_df.set_index(pd.to_datetime(atmos_df["datetime"]).dt.tz_localize(None)).reindex(index.tz_localize(None))
+        atmos = atmos_df[["blh_m", "inversion_strength_k", "rh_pct", "wind_speed_ms", "solar_rad_wm2", "pressure_hpa", "precip_mm"]].to_numpy(dtype=np.float32)
+        atmos = np.where(np.isnan(atmos), _placeholder_atmos(index).astype(np.float32), atmos)  # fill any ERA5 gaps
+    else:
+        atmos = _placeholder_atmos(index).astype(np.float32)
+
+    if regional_wind is not None:
+        for j, source in enumerate(REGIONAL_SOURCES):
+            wdf = regional_wind.get(source.id)
+            if wdf is None or wdf.empty:
+                regional[:, j, 1] = 0.0
+                regional[:, j, 2] = -2.0
+                continue
+            wdf = wdf.set_index(pd.to_datetime(wdf["datetime"]).dt.tz_localize(None)).reindex(index.tz_localize(None))
+            regional[:, j, 1] = np.nan_to_num(wdf["wind_u_ms"].to_numpy(), nan=0.0)
+            regional[:, j, 2] = np.nan_to_num(wdf["wind_v_ms"].to_numpy(), nan=-2.0)
+    else:
+        regional[:, :, 1] = 0.0   # wind_u_ms placeholder
+        regional[:, :, 2] = -2.0  # wind_v_ms placeholder (slight northerly, i.e. toward Delhi -- a guess, not data)
 
     return RawSeries(
         timestamps=pd.DatetimeIndex(index.tz_localize(None)),
