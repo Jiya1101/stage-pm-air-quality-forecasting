@@ -10,8 +10,12 @@ directly covering this project's default 2018-2023 temporal split.
 Requires a free API key: register at https://explore.openaq.org/register,
 then set OPENAQ_API_KEY (or pass api_key=).
 
-Rate limits apply (see https://docs.openaq.org/using-the-api/rate-limits) --
-fetch_station_history paginates responsibly with a small delay between pages.
+Rate limits: free tier is 60 requests/minute, 2000/hour (verified against
+docs.openaq.org/using-the-api/rate-limits). Fetching all 15 LOCAL_STATIONS
+(~10 sensors each) is ~150 requests -- comfortably over the per-minute limit
+in a tight loop, so `_get` throttles proactively using the
+`x-ratelimit-remaining`/`x-ratelimit-reset` response headers and retries
+with backoff on a 429 (confirmed hit during testing without this).
 """
 from __future__ import annotations
 
@@ -31,7 +35,7 @@ TARGET_PARAMETERS = {"pm25", "pm10", "no2", "co", "o3", "relativehumidity", "tem
 
 
 class OpenAQClient:
-    def __init__(self, api_key: str | None = None, timeout: int = 30):
+    def __init__(self, api_key: str | None = None, timeout: int = 30, min_interval_s: float = 1.1):
         self.api_key = api_key or os.environ.get("OPENAQ_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -39,18 +43,56 @@ class OpenAQClient:
                 "and set OPENAQ_API_KEY, or pass api_key=... explicitly."
             )
         self.timeout = timeout
+        self.min_interval_s = min_interval_s  # >1s keeps us under the 60/min free-tier ceiling
         self._session = requests.Session()
         self._session.headers.update({"X-API-Key": self.api_key})
+        self._last_request_t = 0.0
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
-        resp = self._session.get(f"{BASE_URL}{path}", params=params, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
+    def _get(self, path: str, params: dict | None = None, max_retries: int = 5) -> dict:
+        for attempt in range(max_retries):
+            elapsed = time.time() - self._last_request_t
+            if elapsed < self.min_interval_s:
+                time.sleep(self.min_interval_s - elapsed)
+
+            resp = self._session.get(f"{BASE_URL}{path}", params=params, timeout=self.timeout)
+            self._last_request_t = time.time()
+
+            if resp.status_code == 429:
+                reset_s = resp.headers.get("x-ratelimit-reset")
+                wait = float(reset_s) if reset_s and reset_s.replace(".", "", 1).isdigit() else (2 ** attempt) * 2
+                wait = min(wait, 60.0) + 0.5
+                time.sleep(wait)
+                continue
+
+            remaining = resp.headers.get("x-ratelimit-remaining")
+            if remaining is not None and remaining.isdigit() and int(remaining) <= 1:
+                reset_s = resp.headers.get("x-ratelimit-reset")
+                if reset_s and reset_s.replace(".", "", 1).isdigit():
+                    time.sleep(float(reset_s) + 0.5)
+
+            resp.raise_for_status()
+            return resp.json()
+
+        raise RuntimeError(f"OpenAQ API: gave up after {max_retries} retries on 429 for {path}")
 
     def find_locations(self, bbox: tuple[float, float, float, float] = NCR_BBOX, limit: int = 100) -> list[dict]:
-        """List monitoring locations within `bbox` (west, south, east, north)."""
-        params = {"bbox": ",".join(str(v) for v in bbox), "limit": limit}
-        return self._get("/locations", params).get("results", [])
+        """List ALL monitoring locations within `bbox` (west, south, east, north), paginated.
+
+        Verified live: the NCR bbox alone returns 100+ locations, so a
+        single unpaginated page (the previous behavior here) silently missed
+        some -- including, in one observed case, the currently-active
+        duplicate of a station whose other entry had gone stale in 2018.
+        """
+        results, page = [], 1
+        while True:
+            batch = self._get("/locations", {"bbox": ",".join(str(v) for v in bbox), "limit": limit, "page": page}).get("results", [])
+            if not batch:
+                break
+            results.extend(batch)
+            if len(batch) < limit:
+                break
+            page += 1
+        return results
 
     def get_sensors(self, location_id: int) -> list[dict]:
         """List sensors (one per pollutant/met-variable) at a location, with their units and coverage dates."""
@@ -138,15 +180,26 @@ STATION_NAME_OVERRIDES = {
 }
 
 
+def _datetime_last(loc: dict) -> str:
+    return (loc.get("datetimeLast") or {}).get("utc") or ""
+
+
+def _has_pm25(loc: dict) -> bool:
+    return any((s.get("parameter") or {}).get("name") == "pm25" for s in (loc.get("sensors") or []))
+
+
 def match_local_stations_to_openaq(client: OpenAQClient) -> dict[str, dict]:
     """Best-effort name match between graph/stations.py::LOCAL_STATIONS and OpenAQ location IDs.
 
     Returns {station_id: openaq_location_dict}. Matches are by substring on
-    station name -- verify manually before relying on this for a full
-    pipeline run, since OpenAQ station naming doesn't always exactly mirror
-    CPCB's station names, and a couple of stations (verified live) have more
-    than one OpenAQ location id (old + re-registered entries); this picks
-    the first and isn't guaranteed stable across OpenAQ-side changes.
+    station name. IMPORTANT (found the hard way): several stations have more
+    than one OpenAQ location entry for the same physical site -- an old one
+    that stopped reporting in 2018, and a currently-active re-registration.
+    Picking "the first candidate" silently grabbed the dead one for ~9 of 15
+    stations in testing (0% coverage in any recent window, despite matching
+    successfully). This instead prefers, among name matches, whichever
+    candidate has a pm25 sensor and the most recent `datetimeLast` -- i.e.
+    the one that's actually still reporting.
     """
     from aqf.graph.stations import LOCAL_STATIONS
 
@@ -156,5 +209,6 @@ def match_local_stations_to_openaq(client: OpenAQClient) -> dict[str, dict]:
         name_l = STATION_NAME_OVERRIDES.get(station.name, station.name).lower()
         candidates = [loc for loc in locations if name_l in loc.get("name", "").lower() or loc.get("name", "").lower() in name_l]
         if candidates:
+            candidates.sort(key=lambda loc: (_has_pm25(loc), _datetime_last(loc)), reverse=True)
             matches[station.id] = candidates[0]
     return matches

@@ -63,7 +63,8 @@ class FIRMSClient:
 NCR_TRANSPORT_DOMAIN_BBOX = (73.0, 24.0, 79.5, 32.5)  # (west, south, east, north)
 
 
-def fetch_regional_fires(day_range: int = 10, date: str | None = None, map_key: str | None = None) -> pd.DataFrame:
+def fetch_regional_fires(day_range: int = 5, date: str | None = None, map_key: str | None = None) -> pd.DataFrame:
+    """day_range max is 5 -- verified live against the API (some docs claim 10, which it rejects)."""
     client = FIRMSClient(map_key=map_key)
     df = client.fetch_area(NCR_TRANSPORT_DOMAIN_BBOX, day_range=day_range, date=date)
     if df.empty:

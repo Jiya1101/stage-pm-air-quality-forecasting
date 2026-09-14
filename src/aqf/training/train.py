@@ -24,12 +24,14 @@ def load_raw(cfg: Config) -> RawSeries:
                 f"No synthetic dataset at {path}. Run `python scripts/generate_synthetic_data.py` first."
             )
         return RawSeries.load(path)
-    raise NotImplementedError(
-        "config.data.source == 'real' requires assembling CPCB/ERA5/FIRMS pulls into the RawSeries "
-        "schema (see src/aqf/data/schema.py) -- the individual clients are implemented in "
-        "src/aqf/data/{cpcb,era5,firms}.py but the assembly/alignment step is deployment-specific "
-        "(depends on which stations + date range you pull)."
-    )
+    path = os.path.join(cfg.data.real_dir, "raw.npz")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No real dataset at {path}. Run `python scripts/fetch_real_data.py` first "
+            "(requires OPENAQ_API_KEY and FIRMS_MAP_KEY in .env -- see data/real_pipeline.py "
+            "for exactly what's real vs. placeholder in the assembled series)."
+        )
+    return RawSeries.load(path)
 
 
 def build_model(cfg: Config, device: str) -> StagePM:
