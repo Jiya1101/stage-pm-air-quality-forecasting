@@ -1,0 +1,9 @@
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+torch>=2.2
+requests>=2.31
+matplotlib>=3.8
+
+# Optional, only needed for real-data ingestion:
+# cdsapi>=0.6        # ERA5 (src/aqf/data/era5.py)
