@@ -77,10 +77,12 @@ class OpenAQClient:
                 time.sleep(wait)
                 continue
 
-            if resp.status_code >= 500:
-                # Transient server-side failure -- observed live (a bare 500 on page 6 of a sensor's
-                # measurements mid-way through a multi-hour, thousands-of-requests historical pull).
-                # Not our fault and not something a client-side param change fixes; just retry.
+            if resp.status_code >= 500 or resp.status_code == 408:
+                # Transient server-side failure -- observed live, twice, in different forms during
+                # a multi-hour/thousands-of-requests historical pull: a bare 500 on one run, a 408
+                # Request Timeout on another (different pages, different sensors -- clearly load-
+                # related on OpenAQ's end, not a bad request on ours). Retry rather than enumerate
+                # every transient status code OpenAQ might return under sustained load.
                 if attempt == max_retries - 1:
                     resp.raise_for_status()
                 time.sleep(min((2 ** attempt) * 3, 45.0))
