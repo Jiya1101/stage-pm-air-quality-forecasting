@@ -132,13 +132,31 @@ class OpenAQClient:
         `date_to` (which are silently ignored, so an unfiltered call pulls
         the sensor's *entire* history -- caught this during testing when a
         10-day request took minutes instead of seconds).
+
+        If a specific page keeps failing even after _get()'s own retries
+        (observed live: one sensor's page ~12-13 of a multi-year, ~13000+
+        row result hit 408 Request Timeout persistently, ~4 minutes of
+        backoff and all, across two separate runs -- looks like a
+        server-side limitation on deep pagination into a large result for
+        that particular sensor, not a transient blip), this returns
+        whatever pages were successfully collected before the failure
+        rather than losing the whole multi-hour pull over one sensor's one
+        page. A warning is emitted so the gap is visible, not silent.
         """
         rows, page = [], 1
         while True:
-            payload = self._get(
-                f"/sensors/{sensor_id}/measurements/hourly",
-                {"datetime_from": date_from, "datetime_to": date_to, "limit": limit, "page": page},
-            )
+            try:
+                payload = self._get(
+                    f"/sensors/{sensor_id}/measurements/hourly",
+                    {"datetime_from": date_from, "datetime_to": date_to, "limit": limit, "page": page},
+                )
+            except (requests.exceptions.HTTPError, RuntimeError) as e:
+                import warnings
+                warnings.warn(
+                    f"OpenAQ sensor {sensor_id}: giving up on page {page} after repeated failures ({e!r}) "
+                    f"-- returning {len(rows)} rows collected from earlier pages instead of losing them."
+                )
+                break
             results = payload.get("results", [])
             if not results:
                 break
