@@ -31,7 +31,12 @@ def load_raw(cfg: Config) -> RawSeries:
             "(requires OPENAQ_API_KEY and FIRMS_MAP_KEY in .env -- see data/real_pipeline.py "
             "for exactly what's real vs. placeholder in the assembled series)."
         )
-    return RawSeries.load(path)
+    raw = RawSeries.load(path)
+    if raw.local_observed_mask is None:  # not yet imputed -- fill gaps and record what was genuinely observed
+        from aqf.data.real_pipeline import impute_for_training
+
+        raw = impute_for_training(raw)
+    return raw
 
 
 def build_model(cfg: Config, device: str) -> StagePM:
@@ -112,14 +117,15 @@ def run(cfg: Config, verbose: bool = True) -> dict:
 
 @torch.no_grad()
 def _val_mae(model: StagePM, loader: DataLoader, station_mask: torch.Tensor, device: str) -> float:
+    """MAE over non-held-out stations AND genuinely-observed target hours only (see losses/physics.py::forecast_loss)."""
     model.eval()
     total_err, total_n = 0.0, 0
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         out = model(batch)
-        m = station_mask.view(1, -1, 1).to(device).float()
+        station_m = station_mask.view(1, -1, 1).to(device).float()
+        m = station_m * batch["y_observed"] if "y_observed" in batch else station_m.expand_as(out["pm25_mean"])
         err = ((out["pm25_mean"] - batch["y_pm25"]).abs() * m).sum().item()
-        n = m.sum().item() * batch["y_pm25"].shape[-1]
         total_err += err
-        total_n += n
+        total_n += m.sum().item()
     return total_err / max(total_n, 1)

@@ -12,7 +12,13 @@ uncertainty" section) with plain MAE (stabilizes early training before the
 learned variance is well calibrated), plus an exceedance BCE term.
 
 Every term is masked to exclude spatially-held-out stations from contributing
-to training gradients (see data/dataset.py::SplitIndices.held_out_local_mask).
+to training gradients (see data/dataset.py::SplitIndices.held_out_local_mask),
+AND (for real data) to exclude target hours that were imputed rather than
+genuinely observed (see data/real_pipeline.py::impute_for_training and
+batch["y_observed"] from data/dataset.py) -- without the latter, a model
+trained on real data with ~30-36% station uptime would be scored partly on
+how well it reproduces forward/backward-fill interpolation, not real
+forecasting skill.
 """
 from __future__ import annotations
 
@@ -38,19 +44,26 @@ def gaussian_nll(mean: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor)
 
 
 def forecast_loss(out: dict, batch: dict, station_mask: torch.Tensor, train_cfg: TrainConfig | None = None) -> tuple[torch.Tensor, dict]:
-    """station_mask: (N_local,) bool, True = included in loss (i.e. NOT held out)."""
+    """station_mask: (N_local,) bool, True = included in loss (i.e. NOT held out).
+
+    Combined with batch["y_observed"] (B, N_local, n_horizons) -- 1 where
+    the target was genuinely observed, 0 where it was imputed (real data
+    only; defaults to all-ones for synthetic data, see data/dataset.py). A
+    sample masked out here contributes nothing to MAE/NLL/BCE or their
+    reported values, not just zero gradient with a nonzero denominator.
+    """
     mean, logvar, exceed_prob = out["pm25_mean"], out["pm25_logvar"], out["exceed_prob"]
     y, y_exceed = batch["y_pm25"], batch["y_exceed"]
     lambda_nll = train_cfg.lambda_nll if train_cfg is not None else 0.05
 
-    m = station_mask.view(1, -1, 1).to(mean.device)
+    station_m = station_mask.view(1, -1, 1).to(mean.device).float()
+    observed_m = batch.get("y_observed")
+    m = station_m * observed_m.to(mean.device) if observed_m is not None else station_m.expand_as(mean)
     n_active = m.sum().clamp(min=1)
 
-    nll = (gaussian_nll(mean, logvar, y) * m).sum() / (n_active * mean.shape[0] * mean.shape[-1])
-    mae = (F.l1_loss(mean, y, reduction="none") * m).sum() / (n_active * mean.shape[0] * mean.shape[-1])
-    bce = (F.binary_cross_entropy(exceed_prob.clamp(1e-6, 1 - 1e-6), y_exceed, reduction="none") * m).sum() / (
-        n_active * mean.shape[0] * mean.shape[-1]
-    )
+    nll = (gaussian_nll(mean, logvar, y) * m).sum() / n_active
+    mae = (F.l1_loss(mean, y, reduction="none") * m).sum() / n_active
+    bce = (F.binary_cross_entropy(exceed_prob.clamp(1e-6, 1 - 1e-6), y_exceed, reduction="none") * m).sum() / n_active
     return mae + lambda_nll * nll + 0.5 * bce, {"mae": mae.item(), "nll": nll.item(), "exceed_bce": bce.item()}
 
 

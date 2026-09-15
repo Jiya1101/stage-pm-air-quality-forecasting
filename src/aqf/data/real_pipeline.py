@@ -49,21 +49,43 @@ def _hourly_index(date_from: str, date_to: str) -> pd.DatetimeIndex:
     return pd.date_range(date_from, date_to, freq="h", tz="UTC")
 
 
-def fetch_local_stations(date_from: str, date_to: str, api_key: str | None = None) -> dict[str, pd.DataFrame]:
-    """Real OpenAQ pull for every graph/stations.py::LOCAL_STATIONS station."""
+def fetch_local_stations(
+    date_from: str, date_to: str, api_key: str | None = None, cache_dir: str | None = "data/real/.openaq_cache"
+) -> dict[str, pd.DataFrame]:
+    """Real OpenAQ pull for every graph/stations.py::LOCAL_STATIONS station.
+
+    A multi-year pull for 15 stations can take hours (OpenAQ's free-tier cap
+    is 2000 requests/hour, and a 5-year x ~8-sensor pull needs thousands of
+    paginated requests). `cache_dir` (on by default) saves each station's
+    result as soon as it's fetched, so an interrupted run resumes instead of
+    restarting from zero -- set to None to disable.
+    """
+    import os
+
     client = OpenAQClient(api_key=api_key)
     matches = match_local_stations_to_openaq(client)
     missing = [s.name for s in LOCAL_STATIONS if s.id not in matches]
     if missing:
         warnings.warn(f"No OpenAQ location match for: {missing} -- these stations will be all-NaN.")
 
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
     out = {}
     for station in LOCAL_STATIONS:
+        cache_path = os.path.join(cache_dir, f"{station.id}_{date_from}_{date_to}.parquet") if cache_dir else None
+        if cache_path and os.path.exists(cache_path):
+            out[station.id] = pd.read_parquet(cache_path)
+            continue
+
         loc = matches.get(station.id)
         if loc is None:
             out[station.id] = pd.DataFrame()
             continue
-        out[station.id] = client.fetch_station_history(loc["id"], date_from, date_to)
+        df = client.fetch_station_history(loc["id"], date_from, date_to)
+        out[station.id] = df
+        if cache_path:
+            df.to_parquet(cache_path)
     return out
 
 
@@ -72,11 +94,22 @@ def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = Non
 
     Loops the Area API in <=5-day windows -- verified live: the documented
     "1-10" day_range in some FIRMS docs is stale, the API actually rejects
-    anything outside [1, 5] ("Invalid day range. Expects [1..5].").
+    anything outside [1, 5] ("Invalid day range. Expects [1..5.]").
+
+    Source selection (verified live via the data_availability endpoint):
+    VIIRS_SNPP_NRT only retains a rolling ~2.5-month window, so any request
+    older than that returns silently empty, not an error -- caught exactly
+    this while testing a 2019 pull. Anything older than ~75 days uses
+    VIIRS_SNPP_SP instead (verified coverage: 2012-01-20 to 2026-06-30).
     """
+    from aqf.data.firms import DEFAULT_SOURCE, HISTORICAL_SOURCE
+
     client = FIRMSClient(map_key=map_key)
     bbox = (73.0, 24.0, 79.5, 32.5)  # NCR_TRANSPORT_DOMAIN_BBOX, see firms.py
     DAY_RANGE = 5
+
+    is_historical = pd.Timestamp(date_to) < (pd.Timestamp.now() - pd.Timedelta(days=75))
+    source = HISTORICAL_SOURCE if is_historical else DEFAULT_SOURCE
 
     windows = pd.date_range(date_from, date_to, freq=f"{DAY_RANGE}D")
     if windows.empty or windows[-1] < pd.Timestamp(date_to):
@@ -84,7 +117,7 @@ def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = Non
 
     frames = []
     for end_date in windows:
-        df = client.fetch_area(bbox, day_range=DAY_RANGE, date=end_date.strftime("%Y-%m-%d"))
+        df = client.fetch_area(bbox, day_range=DAY_RANGE, date=end_date.strftime("%Y-%m-%d"), source=source)
         if not df.empty:
             frames.append(df)
     if not frames:
@@ -108,11 +141,13 @@ _era5_scratch_dir = "data/real/.era5_cache"
 def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     """Real ERA5 pull: domain-averaged atmos series + per-REGIONAL_SOURCES wind.
 
-    Two CDS requests (single-levels for BLH/wind/RH/solar/pressure/precip,
-    pressure-levels@925hPa for inversion strength), each queued server-side
-    -- expect this to take a few minutes even for a short date range (~1 min
-    was observed for a single-hour test pull). Downloads are cached to
-    `cache_dir` so re-running doesn't re-submit the same CDS request.
+    Chunked by calendar year: a single request spanning multiple years risks
+    hitting CDS's per-request size limits (8 variables x hourly x multi-year
+    is a lot of data) and, if it fails, loses everything already queued.
+    Per-year chunking keeps each CDS request reasonably sized and means a
+    failure in one year doesn't lose progress on the others -- each year's
+    two downloads (single-levels, pressure-levels) are cached to `cache_dir`
+    independently, so a re-run only re-fetches what's missing.
     """
     import os
 
@@ -124,20 +159,32 @@ def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir)
     )
 
     os.makedirs(cache_dir, exist_ok=True)
-    single_path = os.path.join(cache_dir, f"single_{date_from}_{date_to}.nc")
-    pressure_path = os.path.join(cache_dir, f"pressure925_{date_from}_{date_to}.nc")
 
-    if not os.path.exists(single_path):
-        download_era5(single_path, ERA5_DOMAIN_AREA, date_from, date_to)
-    if not os.path.exists(pressure_path):
-        download_era5_pressure_level(pressure_path, ERA5_DOMAIN_AREA, date_from, date_to)
+    years = range(pd.Timestamp(date_from).year, pd.Timestamp(date_to).year + 1)
+    atmos_frames, wind_frames = [], {s.id: [] for s in REGIONAL_SOURCES}
 
-    atmos_df = build_domain_atmos_series(single_path, pressure_path)
+    for year in years:
+        year_start = max(pd.Timestamp(date_from), pd.Timestamp(f"{year}-01-01"))
+        year_end = min(pd.Timestamp(date_to), pd.Timestamp(f"{year}-12-31"))
+        y_from, y_to = year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d")
 
-    regional_wind = {}
-    for source in REGIONAL_SOURCES:
-        regional_wind[source.id] = extract_point_wind_series(single_path, source.lat, source.lon)
+        single_path = os.path.join(cache_dir, f"single_{year}.nc")
+        pressure_path = os.path.join(cache_dir, f"pressure925_{year}.nc")
 
+        if not os.path.exists(single_path):
+            download_era5(single_path, ERA5_DOMAIN_AREA, y_from, y_to)
+        if not os.path.exists(pressure_path):
+            download_era5_pressure_level(pressure_path, ERA5_DOMAIN_AREA, y_from, y_to)
+
+        atmos_frames.append(build_domain_atmos_series(single_path, pressure_path))
+        for source in REGIONAL_SOURCES:
+            wind_frames[source.id].append(extract_point_wind_series(single_path, source.lat, source.lon))
+
+    atmos_df = pd.concat(atmos_frames, ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime")
+    regional_wind = {
+        sid: pd.concat(frames, ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime")
+        for sid, frames in wind_frames.items()
+    }
     return atmos_df, regional_wind
 
 
@@ -167,20 +214,37 @@ def assemble_real_raw_series(
     openaq_api_key: str | None = None,
     firms_map_key: str | None = None,
     use_era5: bool = True,
+    use_opencity_fallback: bool = True,
 ) -> RawSeries:
-    """Build a RawSeries from live OpenAQ + FIRMS (+ ERA5 if available) data.
+    """Build a RawSeries from live OpenAQ + FIRMS (+ ERA5, + opencity.in) data.
 
     See module docstring for what's real vs placeholder. `use_era5=True`
     (default) tries a real ERA5 pull for atmos + regional wind and falls
     back to the documented placeholder climatology with a warning if
     cdsapi/xarray aren't installed or ~/.cdsapirc isn't configured -- so
     this function still works end-to-end without ERA5 access.
+
+    OpenAQ Delhi coverage has a real gap: verified live, every station's
+    original sensor generation stopped ~Jan-Feb 2018 and a fresh one only
+    resumed 2025-02-18 -- a ~7-year hole for most stations (a couple,
+    Wazirpur/Najafgarh, partially bridge it through ~Oct 2022). For any
+    hour where OpenAQ has no PM2.5 reading, `use_opencity_fallback=True`
+    fills it from data.opencity.in's AQI-derived approximate PM2.5 (real
+    2017-2023 hourly coverage for all 15 stations, no gaps, see
+    data/opencity.py -- an *estimate* via CPCB's AQI breakpoint table, not a
+    direct concentration reading, but genuine per-hour signal rather than
+    interpolated filler). Sets `local_observed_mask` to distinguish real
+    OpenAQ readings, real-but-estimated opencity readings, and (after a
+    later `impute_for_training` call) pure interpolation -- see that
+    function and losses/physics.py::forecast_loss for how the distinction
+    is used.
     """
     index = _hourly_index(date_from, date_to)
     T, N_local, N_reg = len(index), len(LOCAL_STATIONS), len(REGIONAL_SOURCES)
 
     local_raw = fetch_local_stations(date_from, date_to, api_key=openaq_api_key)
     local = np.full((T, N_local, len(LOCAL_FEATURE_COLS)), np.nan, dtype=np.float32)
+    real_observed = np.zeros((T, N_local, len(LOCAL_FEATURE_COLS)), dtype=bool)
     col_map = {"pm25": 0, "pm10": 1, "no2": 2, "co": 3, "o3": 4, "temperature": 5, "relativehumidity": 6}
     for i, station in enumerate(LOCAL_STATIONS):
         df = local_raw.get(station.id, pd.DataFrame())
@@ -194,14 +258,20 @@ def assemble_real_raw_series(
         for src_col, dst_idx in col_map.items():
             if src_col in df.columns:
                 local[:, i, dst_idx] = df[src_col].to_numpy()
+                real_observed[:, i, dst_idx] = ~np.isnan(local[:, i, dst_idx])
         if "wind_speed" in df.columns and "wind_direction" in df.columns:
             speed = df["wind_speed"].to_numpy()
             angle = np.radians(df["wind_direction"].to_numpy())
             local[:, i, 7] = -speed * np.sin(angle)  # wind_u_ms (blowing toward, meteorological convention)
             local[:, i, 8] = -speed * np.cos(angle)  # wind_v_ms
+            real_observed[:, i, 7] = ~np.isnan(local[:, i, 7])
+            real_observed[:, i, 8] = ~np.isnan(local[:, i, 8])
         # traffic_index (col 9): no free real-time traffic-count source wired in yet -- diurnal proxy.
         hour = index.hour.to_numpy()
         local[:, i, 9] = 50 + 40 * np.clip(np.sin(2 * np.pi * (hour - 9) / 24), 0, None)
+
+    if use_opencity_fallback:
+        _fill_pm25_from_opencity(local, real_observed, index, date_from, date_to)
 
     regional_fep = fetch_regional_fires(date_from, date_to, map_key=firms_map_key)
     regional = np.zeros((T, N_reg, len(REGIONAL_FEATURE_COLS)), dtype=np.float32)
@@ -251,4 +321,78 @@ def assemble_real_raw_series(
         regional_ids=[s.id for s in REGIONAL_SOURCES],
         source_contrib_gt=None,  # no ground truth for real data -- source_contrib_loss is skipped automatically
         regime_gt=None,
+        local_observed_mask=real_observed,  # True where OpenAQ or opencity gave a genuine reading; see docstring above
     )
+
+
+def _fill_pm25_from_opencity(local: np.ndarray, real_observed: np.ndarray, index: pd.DatetimeIndex, date_from: str, date_to: str) -> None:
+    """Fill NaN pm25 gaps (in place) using data.opencity.in's AQI-derived estimate. See assemble_real_raw_series docstring."""
+    from aqf.data import opencity
+
+    pm25_col = 0  # LOCAL_FEATURE_COLS.index("pm25")
+    still_missing = np.isnan(local[:, :, pm25_col])
+    if not still_missing.any():
+        return
+
+    try:
+        resources = opencity.list_resources()
+    except Exception as e:
+        warnings.warn(f"opencity.in fallback unavailable ({e!r}) -- PM2.5 gaps outside OpenAQ coverage stay unfilled here.")
+        return
+
+    naive_index = index.tz_localize(None) if index.tz is not None else index
+    for i, station in enumerate(LOCAL_STATIONS):
+        if not still_missing[:, i].any():
+            continue
+        frag = opencity.STATION_NAME_OVERRIDES.get(station.name, station.name)
+        try:
+            df = opencity.fetch_station_aqi(frag, resources=resources)
+        except Exception as e:
+            warnings.warn(f"opencity.in fetch failed for {station.name} ({e!r}) -- skipping fallback for this station.")
+            continue
+        df = df.set_index(pd.to_datetime(df["datetime"])).reindex(naive_index)
+        fill_values = df["pm25_approx"].to_numpy()
+        mask = still_missing[:, i] & ~np.isnan(fill_values)
+        local[mask, i, pm25_col] = fill_values[mask]
+        real_observed[mask, i, pm25_col] = True
+
+
+def impute_for_training(raw: RawSeries) -> RawSeries:
+    """Fill gaps in `raw.local` for model input, while recording which values were genuinely observed.
+
+    Real CPCB/DPCC station uptime is intermittent (observed ~30-36% non-NaN
+    in initial testing) -- the model's encoders need a complete array (NaN
+    would propagate through every linear layer), but training should only be
+    *scored* against genuinely-observed target hours, not values this
+    function invented. Sets `raw.local_observed_mask` so
+    losses/physics.py::forecast_loss can mask the loss accordingly -- without
+    this, a naive "impute everything, train against the imputed values"
+    approach is optimistic: it partly measures interpolation smoothness
+    rather than real forecasting skill (this was an explicit caveat on the
+    first real-data smoke test, scripts/smoke_test_real.py).
+
+    Per station, per feature: forward-fill, then backward-fill (for leading
+    gaps with no prior observation yet), then any feature that's NaN for a
+    station's *entire* window falls back to the global mean across all
+    stations at that timestep, or 0.0 if that's also all-NaN.
+    """
+    from aqf.data.schema import LOCAL_FEATURE_COLS
+
+    T, N, F = raw.local.shape
+    observed_mask = ~np.isnan(raw.local)
+    imputed = raw.local.copy()
+
+    for n in range(N):
+        df = pd.DataFrame(imputed[:, n, :], columns=LOCAL_FEATURE_COLS)
+        imputed[:, n, :] = df.ffill().bfill().to_numpy()
+
+    for f in range(F):
+        col = imputed[:, :, f]
+        if np.isnan(col).any():
+            fallback = np.nanmean(col) if not np.isnan(col).all() else 0.0
+            col[np.isnan(col)] = fallback
+            imputed[:, :, f] = col
+
+    raw.local = imputed
+    raw.local_observed_mask = observed_mask
+    return raw

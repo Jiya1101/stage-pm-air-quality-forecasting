@@ -1,57 +1,38 @@
-"""Quick smoke test: does STAGE-PM train and produce sane numbers on the real 21-day OpenAQ+FIRMS pull?
+"""Quick smoke test: does STAGE-PM train and produce sane, honest numbers on real OpenAQ+FIRMS(+ERA5) data?
 
-Not a real evaluation -- the fetched window is short (505 hours) and only
-~30-36% of local PM2.5 readings are actually observed (real CPCB sensor
-downtime, see data/real_pipeline.py). This script forward/backward-fills
-gaps so the pipeline has a complete array to train on, which means the
-reported MAE is optimistic (partly measuring interpolation smoothness, not
-genuine forecasting skill on unseen data) -- it is meant to catch pipeline
-bugs and sanity-check the loss/gradients behave on a real feature
-distribution, not to report a trustworthy accuracy number. A proper
-held-out evaluation needs the full historical pull (more data, a real
-temporal split, and per-sample loss masking on originally-observed hours).
+Uses data/real_pipeline.py::impute_for_training, which fills gaps for the
+model's inputs but records which target hours were genuinely observed vs.
+imputed (raw.local_observed_mask). losses/physics.py::forecast_loss and
+evaluation/evaluate.py both mask on this, so -- unlike an earlier version of
+this script -- the reported val_mae here is scored only against real CPCB
+sensor readings, not interpolated filler. Still a *smoke* test though: the
+fetched window may be short and the train/val split is time-ordered rather
+than by calendar year (too short a pull for that), so treat this as "does
+the pipeline work correctly," not a final accuracy benchmark.
 
 Usage:
     python scripts/smoke_test_real.py
 """
 import _pathfix  # noqa: F401
 import numpy as np
-import pandas as pd
 import torch
 
 from aqf.config import Config
 from aqf.data.dataset import AQFWindowDataset, PM25_IDX
-from aqf.data.schema import RawSeries, LOCAL_FEATURE_COLS
+from aqf.data.real_pipeline import impute_for_training
+from aqf.data.schema import RawSeries
 from aqf.losses.physics import total_loss
-from aqf.training.train import build_model
-
-
-def impute_local_gaps(local: np.ndarray) -> np.ndarray:
-    """Per-station, per-feature forward-fill -> backward-fill -> global-mean fallback."""
-    T, N, F = local.shape
-    out = local.copy()
-    for n in range(N):
-        df = pd.DataFrame(out[:, n, :], columns=LOCAL_FEATURE_COLS)
-        df = df.ffill().bfill()
-        out[:, n, :] = df.to_numpy()
-    # any feature that was NaN for an entire station's whole window (ffill/bfill can't help) -> global column mean
-    for f in range(F):
-        col = out[:, :, f]
-        if np.isnan(col).any():
-            fallback = np.nanmean(col) if not np.isnan(col).all() else 0.0
-            col[np.isnan(col)] = fallback
-            out[:, :, f] = col
-    return out
+from aqf.training.train import build_model, _val_mae
 
 
 def main():
     raw = RawSeries.load("data/real/raw.npz")
     pm25_observed_frac = 1.0 - np.isnan(raw.local[..., PM25_IDX]).mean()
     print(f"Loaded real data: {len(raw.timestamps)} hours, {raw.local.shape[1]} stations, "
-          f"PM2.5 observed (pre-imputation): {pm25_observed_frac:.1%}")
+          f"PM2.5 observed: {pm25_observed_frac:.1%}")
 
-    raw.local = impute_local_gaps(raw.local)
-    print("Gaps filled via ffill/bfill/global-mean (see module docstring caveat).")
+    raw = impute_for_training(raw)
+    print("Gaps filled for model input; genuinely-observed hours tracked separately for scoring.")
 
     cfg = Config(name="real_smoke")
     cfg.data.source = "real"
@@ -97,18 +78,10 @@ def main():
             opt.step()
             losses.append(log["total"])
 
-        model.eval()
-        val_errs = []
-        with torch.no_grad():
-            for batch in val_loader:
-                out = model(batch)
-                err = (out["pm25_mean"] - batch["y_pm25"]).abs().mean().item()
-                val_errs.append(err)
+        val_mae = _val_mae(model, val_loader, station_mask, "cpu")
+        print(f"epoch {epoch+1}/{cfg.train.epochs}  train_loss={np.mean(losses):.3f}  val_mae={val_mae:.3f} (observed-only)")
 
-        print(f"epoch {epoch+1}/{cfg.train.epochs}  train_loss={np.mean(losses):.3f}  val_mae={np.mean(val_errs):.3f}")
-
-    print("\nSmoke test complete: pipeline trains end-to-end on real OpenAQ+FIRMS data without errors.")
-    print("Remember the caveat above -- this MAE is not a trustworthy accuracy number, just a sanity check.")
+    print("\nSmoke test complete: pipeline trains end-to-end on real data, scored only on genuinely-observed hours.")
 
 
 if __name__ == "__main__":

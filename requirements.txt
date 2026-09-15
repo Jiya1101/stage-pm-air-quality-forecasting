@@ -5,6 +5,7 @@ torch>=2.2
 requests>=2.31
 matplotlib>=3.8
 python-dotenv>=1.0
+pyarrow>=14.0          # parquet caching for the multi-hour real-data pulls (data/real_pipeline.py)
 
 # Optional, only needed for real ERA5 ingestion (src/aqf/data/era5.py):
 cdsapi>=0.7.7

@@ -40,6 +40,10 @@ _MONTHS = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
     "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
 }
+# Verified live: NOT every station's CSV uses the "January-2017" header format -- some (e.g. Sonia Vihar)
+# use "Jan-17" (abbreviated month, 2-digit year) instead. A parser handling only the first format
+# silently found zero data rows for that station's entire multi-year file. Handle both.
+_MONTHS_ABBR = {k[:3]: v for k, v in _MONTHS.items()}
 
 # CPCB National AQI sub-index breakpoints for PM2.5 (24-hr avg, ug/m3) -> AQI.
 # (aqi_lo, aqi_hi, conc_lo, conc_hi); used in reverse to approximate concentration from AQI.
@@ -116,13 +120,21 @@ def parse_wide_aqi_csv(text: str) -> pd.DataFrame:
         if not line:
             continue
         parts = line.split(",")
-        if parts[0] == "Year" and len(parts) == 2:
-            year = int(parts[1])
+        # Some station files pad this line with trailing commas ("Year,2017,,,,,...") to match the
+        # 24-hour-column width used elsewhere in the file -- verified live (Sonia Vihar); a strict
+        # len(parts) == 2 check silently never matched, so `year` stayed None and the entire file
+        # parsed to zero rows despite containing real data.
+        if parts[0] == "Year" and len(parts) >= 2 and parts[1].strip().isdigit():
+            year = int(parts[1].strip())
             continue
         first = parts[0]
         month_name = first.split("-")[0] if "-" in first else None
-        if month_name in _MONTHS and len(parts) >= 2 and parts[1].strip().count(":") == 2:
+        is_month_header = len(parts) >= 2 and parts[1].strip().count(":") == 2
+        if is_month_header and month_name in _MONTHS:
             month = _MONTHS[month_name]
+            continue
+        if is_month_header and month_name in _MONTHS_ABBR:  # e.g. "Jan-17" instead of "January-2017"
+            month = _MONTHS_ABBR[month_name]
             continue
         if year is not None and month is not None:
             try:

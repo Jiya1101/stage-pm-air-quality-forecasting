@@ -97,6 +97,13 @@ class AQFWindowDataset(Dataset):
         y = np.stack([self.raw.local[t0 + h, :, PM25_IDX] for h in horizons], axis=-1)  # (N_local, n_horizons)
         y_exceed = (y > self.cfg.exceedance_threshold).astype(np.float32)
 
+        if self.raw.local_observed_mask is not None:
+            y_observed = np.stack(
+                [self.raw.local_observed_mask[t0 + h, :, PM25_IDX] for h in horizons], axis=-1
+            ).astype(np.float32)
+        else:
+            y_observed = np.ones_like(y, dtype=np.float32)  # synthetic / not-yet-imputed data: everything "observed"
+
         sample = {
             "local_seq": torch.from_numpy(local_seq.astype(np.float32)),
             "regional_seq": torch.from_numpy(regional_seq.astype(np.float32)),
@@ -106,6 +113,7 @@ class AQFWindowDataset(Dataset):
             "regional_wind_speed_seq": torch.from_numpy(reg_wind_speed_seq.astype(np.float32)),
             "y_pm25": torch.from_numpy(y.astype(np.float32)),
             "y_exceed": torch.from_numpy(y_exceed),
+            "y_observed": torch.from_numpy(y_observed),
             "t0": torch.tensor(t0, dtype=torch.long),
         }
 

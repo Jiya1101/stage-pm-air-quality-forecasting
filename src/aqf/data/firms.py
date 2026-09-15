@@ -18,8 +18,13 @@ import requests
 
 FIRMS_BASE_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
 
-# VIIRS S-NPP/NOAA-20/NOAA-21 near-real-time (NRT) products, ~375m nominal resolution.
+# VIIRS S-NPP near-real-time (NRT) product, ~375m nominal resolution.
+# IMPORTANT (verified live via the data_availability endpoint): NRT only keeps a rolling
+# ~2.5-month window (observed: 2026-07-01 to 2026-09-15) -- fine for "what's burning now",
+# useless for a historical pull. For any date more than ~2 months old, use HISTORICAL_SOURCE
+# instead (Standard Processing / Science Quality, verified coverage: 2012-01-20 to 2026-06-30).
 DEFAULT_SOURCE = "VIIRS_SNPP_NRT"
+HISTORICAL_SOURCE = "VIIRS_SNPP_SP"
 
 
 class FIRMSClient:

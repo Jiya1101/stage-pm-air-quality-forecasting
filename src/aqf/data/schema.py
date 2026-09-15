@@ -36,6 +36,10 @@ class RawSeries:
       atmos:              (T, len(ATMOS_FEATURE_COLS))
       source_contrib_gt:  (T, N_local, len(SOURCE_CATEGORIES)) or None (synthetic ground truth only)
       regime_gt:          (T, N_local) int categorical or None (synthetic ground truth only)
+      local_observed_mask: (T, N_local, len(LOCAL_FEATURE_COLS)) bool or None -- True where `local` holds a
+                            genuinely-observed reading rather than an imputed/filled value. Real data only
+                            (see data/real_pipeline.py::impute_for_training); None for synthetic data, where
+                            every value is "observed" by construction.
     """
 
     timestamps: pd.DatetimeIndex
@@ -46,6 +50,7 @@ class RawSeries:
     regional_ids: list[str]
     source_contrib_gt: np.ndarray | None = None
     regime_gt: np.ndarray | None = None
+    local_observed_mask: np.ndarray | None = None
 
     def save(self, path: str) -> None:
         np.savez_compressed(
@@ -58,6 +63,7 @@ class RawSeries:
             regional_ids=np.array(self.regional_ids),
             source_contrib_gt=self.source_contrib_gt if self.source_contrib_gt is not None else np.array([]),
             regime_gt=self.regime_gt if self.regime_gt is not None else np.array([]),
+            local_observed_mask=self.local_observed_mask if self.local_observed_mask is not None else np.array([]),
         )
 
     @classmethod
@@ -65,6 +71,7 @@ class RawSeries:
         d = np.load(path, allow_pickle=False)
         sc = d["source_contrib_gt"]
         rg = d["regime_gt"]
+        om = d["local_observed_mask"] if "local_observed_mask" in d else np.array([])
         return cls(
             timestamps=pd.DatetimeIndex(d["timestamps"]),
             local=d["local"],
@@ -74,4 +81,5 @@ class RawSeries:
             regional_ids=list(d["regional_ids"]),
             source_contrib_gt=sc if sc.size else None,
             regime_gt=rg if rg.size else None,
+            local_observed_mask=om if om.size else None,
         )
