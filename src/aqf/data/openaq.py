@@ -48,7 +48,7 @@ class OpenAQClient:
         self._session.headers.update({"X-API-Key": self.api_key})
         self._last_request_t = 0.0
 
-    def _get(self, path: str, params: dict | None = None, max_retries: int = 5) -> dict:
+    def _get(self, path: str, params: dict | None = None, max_retries: int = 8) -> dict:
         for attempt in range(max_retries):
             elapsed = time.time() - self._last_request_t
             if elapsed < self.min_interval_s:
@@ -77,6 +77,15 @@ class OpenAQClient:
                 time.sleep(wait)
                 continue
 
+            if resp.status_code >= 500:
+                # Transient server-side failure -- observed live (a bare 500 on page 6 of a sensor's
+                # measurements mid-way through a multi-hour, thousands-of-requests historical pull).
+                # Not our fault and not something a client-side param change fixes; just retry.
+                if attempt == max_retries - 1:
+                    resp.raise_for_status()
+                time.sleep(min((2 ** attempt) * 3, 45.0))
+                continue
+
             remaining = resp.headers.get("x-ratelimit-remaining")
             if remaining is not None and remaining.isdigit() and int(remaining) <= 1:
                 reset_s = resp.headers.get("x-ratelimit-reset")
@@ -86,7 +95,7 @@ class OpenAQClient:
             resp.raise_for_status()
             return resp.json()
 
-        raise RuntimeError(f"OpenAQ API: gave up after {max_retries} retries (429 / connection errors) for {path}")
+        raise RuntimeError(f"OpenAQ API: gave up after {max_retries} retries (429 / 5xx / connection errors) for {path}")
 
     def find_locations(self, bbox: tuple[float, float, float, float] = NCR_BBOX, limit: int = 100) -> list[dict]:
         """List ALL monitoring locations within `bbox` (west, south, east, north), paginated.
