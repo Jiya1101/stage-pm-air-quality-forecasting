@@ -134,14 +134,19 @@ class OpenAQClient:
         10-day request took minutes instead of seconds).
 
         If a specific page keeps failing even after _get()'s own retries
-        (observed live: one sensor's page ~12-13 of a multi-year, ~13000+
-        row result hit 408 Request Timeout persistently, ~4 minutes of
-        backoff and all, across two separate runs -- looks like a
-        server-side limitation on deep pagination into a large result for
-        that particular sensor, not a transient blip), this returns
+        (observed live, repeatedly, across four different sensors in one
+        run: page 13 of a large multi-year result hits 408 Request Timeout
+        every single time, never anything else -- this is a consistent
+        server-side pagination-depth limit, not noise), this returns
         whatever pages were successfully collected before the failure
         rather than losing the whole multi-hour pull over one sensor's one
         page. A warning is emitted so the gap is visible, not silent.
+
+        Pages beyond 12 get far fewer _get() retries (2 instead of the
+        default 8): once four-for-four sensors hit the exact same wall at
+        the exact same page, spending ~4 minutes of exponential backoff
+        confirming it a fifth, sixth, seventh time is pure waste -- fail
+        fast there and move on.
         """
         rows, page = [], 1
         while True:
@@ -149,6 +154,7 @@ class OpenAQClient:
                 payload = self._get(
                     f"/sensors/{sensor_id}/measurements/hourly",
                     {"datetime_from": date_from, "datetime_to": date_to, "limit": limit, "page": page},
+                    max_retries=8 if page <= 12 else 2,
                 )
             except (requests.exceptions.HTTPError, RuntimeError) as e:
                 import warnings
