@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from aqf.data.dataset import AQFWindowDataset
+from aqf.data.dataset import PM25_IDX, AQFWindowDataset
 from aqf.data.schema import REGIME_CATEGORIES
 from aqf.evaluation.metrics import coverage, critical_success_index, mae, metrics_by_bucket, pollution_bucket, rmse
 from aqf.losses.physics import PM_SCALE
@@ -20,7 +20,7 @@ from aqf.models.stage_pm import StagePM
 def collect_predictions(model: StagePM, dataset: AQFWindowDataset, device: str, batch_size: int = 32):
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    preds, stds, targets, observed_all, regime_all = [], [], [], [], []
+    preds, stds, targets, observed_all, regime_all, persist_all = [], [], [], [], [], []
     for batch in loader:
         batch_dev = {k: v.to(device) for k, v in batch.items()}
         out = model(batch_dev)
@@ -28,6 +28,9 @@ def collect_predictions(model: StagePM, dataset: AQFWindowDataset, device: str, 
         # logvar is defined in PM_SCALE-normalized units (see losses/physics.py) -> convert back to real PM2.5 std.
         stds.append((torch.exp(0.5 * out["pm25_logvar"]) * PM_SCALE).cpu().numpy())
         targets.append(batch["y_pm25"].numpy())
+        # Persistence baseline: the last PM2.5 the model was shown (t0), carried forward unchanged to every horizon.
+        last = batch["local_seq"][:, -1, :, PM25_IDX].numpy()
+        persist_all.append(np.repeat(last[:, :, None], batch["y_pm25"].shape[-1], axis=-1))
         observed_all.append(batch["y_observed"].numpy() if "y_observed" in batch else np.ones_like(batch["y_pm25"].numpy()))
         if "y_regime" in batch:
             regime_all.append(batch["y_regime"].numpy())
@@ -36,7 +39,8 @@ def collect_predictions(model: StagePM, dataset: AQFWindowDataset, device: str, 
     targets = np.concatenate(targets, axis=0)
     observed = np.concatenate(observed_all, axis=0).astype(bool)  # False where the real target was imputed, not observed
     regime = np.concatenate(regime_all, axis=0) if regime_all else None
-    return preds, stds, targets, observed, regime
+    persist = np.concatenate(persist_all, axis=0)
+    return preds, stds, targets, observed, regime, persist
 
 
 def evaluate(
@@ -47,7 +51,7 @@ def evaluate(
     horizons: tuple,
     device: str = "cpu",
 ) -> dict:
-    preds, stds, targets, observed, regime = collect_predictions(model, test_ds, device)
+    preds, stds, targets, observed, regime, persist = collect_predictions(model, test_ds, device)
     in_sample = ~held_out_local_mask
     report: dict = {"overall": {}, "per_horizon": {}, "per_bucket": {}, "per_regime": {}, "spatial_holdout": {}}
 
@@ -69,6 +73,18 @@ def evaluate(
 
     bucket = pollution_bucket(targets)
     report["per_bucket"] = metrics_by_bucket(preds[observed], targets[observed], bucket[observed])
+
+    # Persistence reference, scored on exactly the same observed hours. skill = 1 - MAE_model / MAE_persistence:
+    # > 0 means the model beats "same as the last reading"; <= 0 means it doesn't, whatever its raw MAE looks like.
+    persist_mae = {f"+{h}h": mae(persist[:, :, i][observed[:, :, i]], targets[:, :, i][observed[:, :, i]]) for i, h in enumerate(horizons)}
+    report["persistence"] = {
+        "overall_mae": mae(persist[observed], targets[observed]),
+        "per_horizon_mae": persist_mae,
+        "per_bucket": metrics_by_bucket(persist[observed], targets[observed], bucket[observed]),
+    }
+    report["skill_vs_persistence"] = {
+        h: 1.0 - report["per_horizon"][h]["mae"] / persist_mae[h] for h in persist_mae
+    }
 
     if regime is not None:
         regime_expanded = np.repeat(regime[:, :, None], preds.shape[-1], axis=-1)
@@ -101,9 +117,16 @@ def print_report(name: str, report: dict) -> None:
     print("Per horizon:")
     for h, m in report["per_horizon"].items():
         print(f"  {h}: MAE={m['mae']:.2f} RMSE={m['rmse']:.2f} CSI={m['csi']:.3f}")
+    if "persistence" in report:
+        print("vs persistence (last reading carried forward), same observed hours:")
+        for h, pm in report["persistence"]["per_horizon_mae"].items():
+            print(f"  {h}: persistence MAE={pm:.2f}  model MAE={report['per_horizon'][h]['mae']:.2f}  "
+                  f"skill={report['skill_vs_persistence'][h]:+.2f}")
     print("Per pollution bucket:")
     for b, m in report["per_bucket"].items():
-        print(f"  {b}: n={m['n']} MAE={m['mae']:.2f} RMSE={m['rmse']:.2f}")
+        pb = report.get("persistence", {}).get("per_bucket", {}).get(b)
+        extra = f"  (persistence MAE={pb['mae']:.2f})" if pb else ""
+        print(f"  {b}: n={m['n']} MAE={m['mae']:.2f} RMSE={m['rmse']:.2f}{extra}")
     if report["per_regime"]:
         print("Per regime:")
         for r, m in report["per_regime"].items():

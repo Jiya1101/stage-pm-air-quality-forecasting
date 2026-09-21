@@ -119,7 +119,7 @@ class StagePM(nn.Module):
         h_seq = h.permute(0, 2, 1, 3)  # (B, N_local, L, D)
         z = self.temporal(h_seq)        # (B, N_local, D)
 
-        out = self.forecast_head(z)
+        out = self.forecast_head(z, last=local_seq[:, -1, :, PM25_IDX])  # residual on the last reading
         if self.source_head is not None:
             out["source_contrib"] = self.source_head(z)
         if self.regime_head is not None:

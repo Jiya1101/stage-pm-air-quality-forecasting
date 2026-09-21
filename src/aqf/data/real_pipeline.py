@@ -187,7 +187,7 @@ def _era5_chunks(kind: str, downloader, start: pd.Timestamp, end: pd.Timestamp, 
         return out
 
 
-def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir, max_workers: int = 6) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Real ERA5 pull: domain-averaged atmos series, per-REGIONAL_SOURCES wind, and per-station local met.
 
     Starts from one request per calendar year and adaptively halves any
@@ -209,13 +209,23 @@ def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir)
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    single_paths: list[str] = []
-    pressure_paths: list[str] = []
+    # CDS queues each request server-side and a quarter-year single-level chunk took >13 minutes in
+    # testing, so ~24 chunks + the pressure-level ones run one after another would be most of a day.
+    # The per-year streams are independent; submit them concurrently (each cdsapi call builds its own
+    # Client, so this is thread-safe) and let CDS interleave them.
+    from concurrent.futures import ThreadPoolExecutor
+
+    jobs = []
     for year in range(pd.Timestamp(date_from).year, pd.Timestamp(date_to).year + 1):
         y_start = max(pd.Timestamp(date_from), pd.Timestamp(f"{year}-01-01"))
         y_end = min(pd.Timestamp(date_to), pd.Timestamp(f"{year}-12-31"))
-        single_paths += _era5_chunks("single", download_era5, y_start, y_end, cache_dir)
-        pressure_paths += _era5_chunks("pressure925", download_era5_pressure_level, y_start, y_end, cache_dir)
+        jobs.append(("single", download_era5, y_start, y_end))
+        jobs.append(("pressure925", download_era5_pressure_level, y_start, y_end))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(lambda j: (j[0], _era5_chunks(j[0], j[1], j[2], j[3], cache_dir)), jobs))
+    single_paths = [p for kind, paths in results if kind == "single" for p in paths]
+    pressure_paths = [p for kind, paths in results if kind == "pressure925" for p in paths]
 
     single_frames = [build_domain_atmos_series(p, None, keep_t2m=True) for p in single_paths]
     atmos_df = pd.concat(single_frames, ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime")
