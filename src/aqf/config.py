@@ -43,6 +43,7 @@ class DataConfig:
     horizons_hours: tuple = (1, 6, 24)
     exceedance_threshold: float = 200.0  # CPCB "severe" PM2.5 threshold (ug/m3)
     spatial_holdout_frac: float = 0.15   # fraction of local stations held out entirely
+    stride_hours: int = 6                # step between window start times (1 = every hour; larger = faster, fewer samples)
 
 
 @dataclass

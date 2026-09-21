@@ -104,14 +104,19 @@ def open_era5_dataset(path: str):
     import zipfile
 
     if zipfile.is_zipfile(path):
-        import tempfile
-
-        extract_dir = tempfile.mkdtemp(prefix="era5_")
-        with zipfile.ZipFile(path) as z:
-            nc_members = [n for n in z.namelist() if n.endswith(".nc")]
-            z.extractall(extract_dir, members=nc_members)
         import os
 
+        # Unzip once, next to the download, and reuse it: the old version made a fresh tempdir on
+        # every open and never cleaned it up, which adds up fast when each multi-month chunk gets
+        # opened once per extraction (dozens of chunks x several passes).
+        extract_dir = path + ".unzipped"
+        if not os.path.isdir(extract_dir):
+            tmp_dir = extract_dir + ".tmp"
+            with zipfile.ZipFile(path) as z:
+                nc_members = [n for n in z.namelist() if n.endswith(".nc")]
+                z.extractall(tmp_dir, members=nc_members)
+            os.replace(tmp_dir, extract_dir)
+        nc_members = sorted(n for n in os.listdir(extract_dir) if n.endswith(".nc"))
         datasets = [xr.open_dataset(os.path.join(extract_dir, m)) for m in nc_members]
         return xr.merge(datasets, compat="override", join="outer")
 
@@ -196,7 +201,7 @@ def download_era5_pressure_level(
     return output_nc_path
 
 
-def build_domain_atmos_series(single_level_nc: str, pressure_level_nc: str | None = None) -> pd.DataFrame:
+def build_domain_atmos_series(single_level_nc: str, pressure_level_nc: str | None = None, keep_t2m: bool = False) -> pd.DataFrame:
     """Spatially-averaged hourly atmospheric series over the whole downloaded domain.
 
     This is the real replacement for real_pipeline.py's `_placeholder_atmos`
@@ -205,6 +210,13 @@ def build_domain_atmos_series(single_level_nc: str, pressure_level_nc: str | Non
     bounding box rather than tied to a single station (matches how the
     synthetic generator and the model's G_A atmospheric-state layer treat
     it: a domain-wide conditioning signal, not a per-station one).
+
+    `keep_t2m=True` (only meaningful when `pressure_level_nc` is None) leaves
+    the 2m temperature in a `_t2m_k` column and skips the inversion column,
+    so a caller whose single-level and pressure-level downloads were split
+    into *different* time chunks (CDS request-cost limits can force
+    different chunk sizes for the 8-variable and 1-variable requests) can
+    combine them itself -- see real_pipeline.fetch_era5.
     """
     ds = open_era5_dataset(single_level_nc)
     spatial_dims = [d for d in ("latitude", "longitude") if d in ds.dims]
@@ -233,11 +245,22 @@ def build_domain_atmos_series(single_level_nc: str, pressure_level_nc: str | Non
         out = out.merge(pmean[["datetime", "_t925_k"]], on="datetime", how="left")
         out["inversion_strength_k"] = inversion_strength_from_profile(out["_t2m_k"].to_numpy(), out["_t925_k"].to_numpy())
         out = out.drop(columns=["_t2m_k", "_t925_k"])
-    else:
+    elif not keep_t2m:
         out["inversion_strength_k"] = 0.0
         out = out.drop(columns=[c for c in ("_t2m_k",) if c in out.columns])
 
     return out
+
+
+def domain_t925_series(pressure_level_nc: str) -> pd.DataFrame:
+    """Spatially-averaged hourly 925hPa temperature (`datetime`, `_t925_k`) from a pressure-level download."""
+    pds = open_era5_dataset(pressure_level_nc)
+    p_spatial_dims = [d for d in ("latitude", "longitude") if d in pds.dims]
+    pmean = pds.mean(dim=p_spatial_dims).to_dataframe().reset_index()
+    p_time_col = "valid_time" if "valid_time" in pmean.columns else "time"
+    pmean = pmean.rename(columns={p_time_col: "datetime", "t": "_t925_k"})
+    pmean["datetime"] = pd.to_datetime(pmean["datetime"])
+    return pmean[["datetime", "_t925_k"]]
 
 
 def extract_point_wind_series(nc_path: str, lat: float, lon: float) -> pd.DataFrame:
@@ -250,4 +273,28 @@ def extract_point_wind_series(nc_path: str, lat: float, lon: float) -> pd.DataFr
     out = pd.DataFrame({"datetime": pd.to_datetime(df[time_col])})
     out["wind_u_ms"] = df.get("u10", 0.0)
     out["wind_v_ms"] = df.get("v10", 0.0)
+    return out
+
+
+def extract_points_met(nc_path: str, points: dict[str, tuple[float, float]]) -> dict[str, pd.DataFrame]:
+    """Nearest-grid-cell hourly met series for many (lat, lon) points from one downloaded chunk.
+
+    Opens the file once. Returns {point_id: DataFrame[datetime, wind_u_ms,
+    wind_v_ms, temp_c, rh_pct]}. Wind follows the same "blowing toward"
+    convention as the OpenAQ-derived local wind (ERA5 u10/v10 are the
+    eastward/northward components of where the air is moving).
+    """
+    ds = open_era5_dataset(nc_path)
+    out = {}
+    for pid, (lat, lon) in points.items():
+        df = ds.sel(latitude=lat, longitude=lon, method="nearest").to_dataframe().reset_index()
+        time_col = "valid_time" if "valid_time" in df.columns else "time"
+        frame = pd.DataFrame({"datetime": pd.to_datetime(df[time_col])})
+        frame["wind_u_ms"] = df["u10"] if "u10" in df.columns else np.nan
+        frame["wind_v_ms"] = df["v10"] if "v10" in df.columns else np.nan
+        if "t2m" in df.columns:
+            frame["temp_c"] = df["t2m"] - 273.15
+            if "d2m" in df.columns:
+                frame["rh_pct"] = relative_humidity_from_dewpoint(df["t2m"].to_numpy(), df["d2m"].to_numpy())
+        out[pid] = frame
     return out

@@ -32,7 +32,7 @@ def load_raw(cfg: Config) -> RawSeries:
             "for exactly what's real vs. placeholder in the assembled series)."
         )
     raw = RawSeries.load(path)
-    if raw.local_observed_mask is None:  # not yet imputed -- fill gaps and record what was genuinely observed
+    if np.isnan(raw.local).any():  # gaps left by the fetch step -- fill for model input, keeping the observed mask
         from aqf.data.real_pipeline import impute_for_training
 
         raw = impute_for_training(raw)
@@ -58,7 +58,7 @@ def run(cfg: Config, verbose: bool = True) -> dict:
     device = cfg.train.device
 
     raw = load_raw(cfg)
-    split = make_split(raw, cfg.data, stride_hours=6, seed=cfg.train.seed)
+    split = make_split(raw, cfg.data, stride_hours=cfg.data.stride_hours, seed=cfg.train.seed)
 
     train_ds = AQFWindowDataset(raw, cfg.data, split.train_t0)
     val_ds = AQFWindowDataset(raw, cfg.data, split.val_t0)

@@ -20,6 +20,7 @@ from torch import nn
 
 from aqf.config import AblationFlags, GraphConfig, ModelConfig
 from aqf.data.dataset import PM25_IDX
+from aqf.losses.physics import PM_SCALE
 from aqf.graph.builder import DynamicGraphBuilder, StaticGraph
 from aqf.models.encoders import AtmosphericEncoder, LocalEncoder, SourceEncoder
 from aqf.models.heads import ForecastHead, RegimeHead, SourceContributionHead
@@ -135,8 +136,13 @@ class StagePM(nn.Module):
             self.graph_cfg.min_wind_speed_ms, self.graph_cfg.max_wind_speed_ms, self.graph_cfg.max_lag_hours,
         ).squeeze(-1)  # (B, L, N_local)
 
-        C = local_seq[..., PM25_IDX]  # (B, L, N_local) observed PM2.5
-        physics_terms = self.scalar_physics(C, A_adv, A_diff, external_scalar)
+        # Dimensionless units for the physics terms: PM2.5 / PM_SCALE, and log1p of the (heavy-tailed,
+        # 0-500+) fire-emission proxy. In raw ug/m3 the ADR residuals scale as PM^2 (and the mass
+        # budget as N_stations^2 on top), which made L_mass ~90% of the total loss even at lambda=0.05
+        # -- measured, not assumed; see scripts/loss_breakdown.py. The learnable advection/diffusion/
+        # reaction/external coefficients are unaffected: they just live in normalized space now.
+        C = local_seq[..., PM25_IDX] / PM_SCALE  # (B, L, N_local) observed PM2.5, dimensionless
+        physics_terms = self.scalar_physics(C, A_adv, A_diff, torch.log1p(external_scalar.clamp(min=0.0)))
         physics_terms["S_t"] = S_t.squeeze(-1)  # (B, L)
 
         out["_physics"] = physics_terms

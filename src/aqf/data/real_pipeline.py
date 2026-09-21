@@ -138,54 +138,164 @@ ERA5_DOMAIN_AREA = (32.5, 73.0, 24.0, 79.5)  # (north, west, south, east) -- sam
 _era5_scratch_dir = "data/real/.era5_cache"
 
 
-def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
-    """Real ERA5 pull: domain-averaged atmos series + per-REGIONAL_SOURCES wind.
+def _split_range(start: pd.Timestamp, end: pd.Timestamp):
+    """Split [start, end] into two contiguous halves, on a month boundary when the range spans several months."""
+    if (start.year, start.month) != (end.year, end.month):
+        months = pd.period_range(start, end, freq="M")
+        boundary = months[len(months) // 2].start_time
+        return (start, boundary - pd.Timedelta(days=1)), (boundary, end)
+    if start == end:
+        return None
+    mid = start + (end - start) // 2
+    return (start, mid), (mid + pd.Timedelta(days=1), end)
 
-    Chunked by calendar year: a single request spanning multiple years risks
-    hitting CDS's per-request size limits (8 variables x hourly x multi-year
-    is a lot of data) and, if it fails, loses everything already queued.
-    Per-year chunking keeps each CDS request reasonably sized and means a
-    failure in one year doesn't lose progress on the others -- each year's
-    two downloads (single-levels, pressure-levels) are cached to `cache_dir`
-    independently, so a re-run only re-fetches what's missing.
+
+def _era5_chunks(kind: str, downloader, start: pd.Timestamp, end: pd.Timestamp, cache_dir: str) -> list[str]:
+    """Download [start, end] via `downloader`, recursively halving on CDS "cost limits exceeded" errors.
+
+    Verified live: a full-year 8-variable request over the NCR domain is
+    rejected with `403 cost limits exceeded -- Your request is too large`,
+    while a 21-day one was fine, and the ceiling isn't documented anywhere
+    convenient. Rather than guess a chunk size, start big and let the API
+    tell us -- each accepted chunk is cached under its own date-range name,
+    so re-runs (and a crash halfway through hours of queued requests) only
+    re-fetch what's missing. Downloads land in a `.part` file first so an
+    interrupted download can't be mistaken for a finished one.
+    """
+    import os
+
+    path = os.path.join(cache_dir, f"{kind}_{start:%Y%m%d}_{end:%Y%m%d}.nc")
+    if os.path.exists(path):
+        return [path]
+    tmp = path + ".part"
+    try:
+        downloader(tmp, ERA5_DOMAIN_AREA, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        os.replace(tmp, path)
+        print(f"[era5] {kind}: got {start:%Y-%m-%d}..{end:%Y-%m-%d}", flush=True)
+        return [path]
+    except Exception as e:
+        msg = str(e).lower()
+        if "cost limits" not in msg and "too large" not in msg:
+            raise
+        halves = _split_range(start, end)
+        if halves is None:
+            raise
+        print(f"[era5] {kind}: {start:%Y-%m-%d}..{end:%Y-%m-%d} too large for CDS, splitting", flush=True)
+        out: list[str] = []
+        for a, b in halves:
+            out += _era5_chunks(kind, downloader, a, b, cache_dir)
+        return out
+
+
+def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    """Real ERA5 pull: domain-averaged atmos series, per-REGIONAL_SOURCES wind, and per-station local met.
+
+    Starts from one request per calendar year and adaptively halves any
+    request CDS rejects as too large (see `_era5_chunks`). The single-level
+    (8 variables) and pressure-level (925hPa temperature only) downloads are
+    chunked independently -- the second is ~8x cheaper per request so it may
+    tolerate much bigger chunks -- and combined afterwards on `datetime`.
     """
     import os
 
     from aqf.data.era5 import (
         build_domain_atmos_series,
+        domain_t925_series,
         download_era5,
         download_era5_pressure_level,
-        extract_point_wind_series,
+        extract_points_met,
+        inversion_strength_from_profile,
     )
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    years = range(pd.Timestamp(date_from).year, pd.Timestamp(date_to).year + 1)
-    atmos_frames, wind_frames = [], {s.id: [] for s in REGIONAL_SOURCES}
+    single_paths: list[str] = []
+    pressure_paths: list[str] = []
+    for year in range(pd.Timestamp(date_from).year, pd.Timestamp(date_to).year + 1):
+        y_start = max(pd.Timestamp(date_from), pd.Timestamp(f"{year}-01-01"))
+        y_end = min(pd.Timestamp(date_to), pd.Timestamp(f"{year}-12-31"))
+        single_paths += _era5_chunks("single", download_era5, y_start, y_end, cache_dir)
+        pressure_paths += _era5_chunks("pressure925", download_era5_pressure_level, y_start, y_end, cache_dir)
 
-    for year in years:
-        year_start = max(pd.Timestamp(date_from), pd.Timestamp(f"{year}-01-01"))
-        year_end = min(pd.Timestamp(date_to), pd.Timestamp(f"{year}-12-31"))
-        y_from, y_to = year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d")
+    single_frames = [build_domain_atmos_series(p, None, keep_t2m=True) for p in single_paths]
+    atmos_df = pd.concat(single_frames, ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime")
 
-        single_path = os.path.join(cache_dir, f"single_{year}.nc")
-        pressure_path = os.path.join(cache_dir, f"pressure925_{year}.nc")
+    t925 = pd.concat([domain_t925_series(p) for p in pressure_paths], ignore_index=True).drop_duplicates(subset="datetime")
+    atmos_df = atmos_df.merge(t925, on="datetime", how="left")
+    atmos_df["inversion_strength_k"] = inversion_strength_from_profile(atmos_df["_t2m_k"].to_numpy(), atmos_df["_t925_k"].to_numpy())
+    atmos_df = atmos_df.drop(columns=["_t2m_k", "_t925_k"])
 
-        if not os.path.exists(single_path):
-            download_era5(single_path, ERA5_DOMAIN_AREA, y_from, y_to)
-        if not os.path.exists(pressure_path):
-            download_era5_pressure_level(pressure_path, ERA5_DOMAIN_AREA, y_from, y_to)
-
-        atmos_frames.append(build_domain_atmos_series(single_path, pressure_path))
-        for source in REGIONAL_SOURCES:
-            wind_frames[source.id].append(extract_point_wind_series(single_path, source.lat, source.lon))
-
-    atmos_df = pd.concat(atmos_frames, ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime")
-    regional_wind = {
-        sid: pd.concat(frames, ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime")
-        for sid, frames in wind_frames.items()
+    points = {s.id: (s.lat, s.lon) for s in REGIONAL_SOURCES}
+    points.update({s.id: (s.lat, s.lon) for s in LOCAL_STATIONS})
+    per_chunk = [extract_points_met(p, points) for p in single_paths]
+    merged = {
+        pid: pd.concat([c[pid] for c in per_chunk], ignore_index=True).drop_duplicates(subset="datetime").sort_values("datetime")
+        for pid in points
     }
-    return atmos_df, regional_wind
+    regional_wind = {s.id: merged[s.id][["datetime", "wind_u_ms", "wind_v_ms"]] for s in REGIONAL_SOURCES}
+    local_met = {s.id: merged[s.id] for s in LOCAL_STATIONS}
+    return atmos_df, regional_wind, local_met
+
+
+def apply_era5_to_raw(
+    raw: RawSeries,
+    atmos_df: pd.DataFrame,
+    regional_wind: dict[str, pd.DataFrame],
+    local_met: dict[str, pd.DataFrame] | None = None,
+) -> dict:
+    """Overwrite `raw.atmos` and the regional wind columns with real ERA5 values, in place.
+
+    Any hour ERA5 doesn't cover (e.g. the ~5-day reanalysis latency at the
+    recent end) keeps the placeholder climatology rather than becoming NaN.
+    Returns coverage stats so callers can see how much of the series is
+    real vs placeholder.
+    """
+    index = pd.DatetimeIndex(raw.timestamps)
+    cols = ["blh_m", "inversion_strength_k", "rh_pct", "wind_speed_ms", "solar_rad_wm2", "pressure_hpa", "precip_mm"]
+
+    df = atmos_df.set_index(pd.to_datetime(atmos_df["datetime"]).dt.tz_localize(None)).reindex(index)
+    era5 = df[cols].to_numpy(dtype=np.float32)
+    placeholder = _placeholder_atmos(index).astype(np.float32)
+    raw.atmos = np.where(np.isnan(era5), placeholder, era5).astype(np.float32)
+
+    wind_cov = {}
+    for j, sid in enumerate(raw.regional_ids):
+        wdf = regional_wind.get(sid)
+        if wdf is None or wdf.empty:
+            continue
+        wdf = wdf.set_index(pd.to_datetime(wdf["datetime"]).dt.tz_localize(None)).reindex(index)
+        u, v = wdf["wind_u_ms"].to_numpy(), wdf["wind_v_ms"].to_numpy()
+        raw.regional[:, j, 1] = np.where(np.isnan(u), 0.0, u)
+        raw.regional[:, j, 2] = np.where(np.isnan(v), -2.0, v)
+        wind_cov[sid] = float(1.0 - np.isnan(u).mean())
+
+    local_filled = {}
+    if local_met:
+        # Fill temp / RH / wind at each station from the ERA5 cell nearest it, but ONLY where the
+        # station has no reading of its own (OpenAQ has nothing for most stations across 2018-2023).
+        # Without this those columns fall through to impute_for_training's global-mean fallback --
+        # i.e. a constant, which for local wind would make the wind-aligned local graph meaningless.
+        col_map = {"temp_c": 5, "rh_pct": 6, "wind_u_ms": 7, "wind_v_ms": 8}
+        for i, sid in enumerate(raw.local_ids):
+            mdf = local_met.get(sid)
+            if mdf is None or mdf.empty:
+                continue
+            mdf = mdf.set_index(pd.to_datetime(mdf["datetime"]).dt.tz_localize(None)).reindex(index)
+            n = 0
+            for name, dst in col_map.items():
+                if name not in mdf.columns:
+                    continue
+                vals = mdf[name].to_numpy(dtype=np.float32)
+                gap = np.isnan(raw.local[:, i, dst]) & ~np.isnan(vals)
+                raw.local[gap, i, dst] = vals[gap]
+                n += int(gap.sum())
+            local_filled[sid] = n
+
+    return {
+        "atmos_era5_coverage": float(1.0 - np.isnan(era5).any(axis=1).mean()),
+        "regional_wind_coverage": wind_cov,
+        "local_met_cells_filled": int(sum(local_filled.values())),
+    }
 
 
 def _placeholder_atmos(index: pd.DatetimeIndex) -> np.ndarray:
@@ -284,35 +394,11 @@ def assemble_real_raw_series(
     regional[:, :, 3] = 15.0  # industry_index placeholder
     regional[:, :, 4] = 5.0   # dust_index placeholder
 
-    atmos_df, regional_wind = None, None
-    if use_era5:
-        try:
-            atmos_df, regional_wind = fetch_era5(date_from, date_to)
-        except Exception as e:  # cdsapi/xarray missing, ~/.cdsapirc not set up, license not accepted, etc.
-            warnings.warn(f"ERA5 fetch failed ({e!r}) -- falling back to placeholder atmos/regional-wind data.")
+    atmos = _placeholder_atmos(index).astype(np.float32)
+    regional[:, :, 1] = 0.0   # wind_u_ms placeholder, replaced below if ERA5 is available
+    regional[:, :, 2] = -2.0  # wind_v_ms placeholder (slight northerly, i.e. toward Delhi -- a guess, not data)
 
-    if atmos_df is not None:
-        atmos_df = atmos_df.set_index(pd.to_datetime(atmos_df["datetime"]).dt.tz_localize(None)).reindex(index.tz_localize(None))
-        atmos = atmos_df[["blh_m", "inversion_strength_k", "rh_pct", "wind_speed_ms", "solar_rad_wm2", "pressure_hpa", "precip_mm"]].to_numpy(dtype=np.float32)
-        atmos = np.where(np.isnan(atmos), _placeholder_atmos(index).astype(np.float32), atmos)  # fill any ERA5 gaps
-    else:
-        atmos = _placeholder_atmos(index).astype(np.float32)
-
-    if regional_wind is not None:
-        for j, source in enumerate(REGIONAL_SOURCES):
-            wdf = regional_wind.get(source.id)
-            if wdf is None or wdf.empty:
-                regional[:, j, 1] = 0.0
-                regional[:, j, 2] = -2.0
-                continue
-            wdf = wdf.set_index(pd.to_datetime(wdf["datetime"]).dt.tz_localize(None)).reindex(index.tz_localize(None))
-            regional[:, j, 1] = np.nan_to_num(wdf["wind_u_ms"].to_numpy(), nan=0.0)
-            regional[:, j, 2] = np.nan_to_num(wdf["wind_v_ms"].to_numpy(), nan=-2.0)
-    else:
-        regional[:, :, 1] = 0.0   # wind_u_ms placeholder
-        regional[:, :, 2] = -2.0  # wind_v_ms placeholder (slight northerly, i.e. toward Delhi -- a guess, not data)
-
-    return RawSeries(
+    raw = RawSeries(
         timestamps=pd.DatetimeIndex(index.tz_localize(None)),
         local=local,
         regional=regional,
@@ -323,6 +409,16 @@ def assemble_real_raw_series(
         regime_gt=None,
         local_observed_mask=real_observed,  # True where OpenAQ or opencity gave a genuine reading; see docstring above
     )
+
+    if use_era5:
+        try:
+            atmos_df, regional_wind, local_met = fetch_era5(date_from, date_to)
+            stats = apply_era5_to_raw(raw, atmos_df, regional_wind, local_met)
+            print(f"ERA5 applied: {stats}", flush=True)
+        except Exception as e:  # cdsapi/xarray missing, ~/.cdsapirc not set up, license not accepted, etc.
+            warnings.warn(f"ERA5 fetch failed ({e!r}) -- falling back to placeholder atmos/regional-wind data.")
+
+    return raw
 
 
 def _fill_pm25_from_opencity(local: np.ndarray, real_observed: np.ndarray, index: pd.DatetimeIndex, date_from: str, date_to: str) -> None:
@@ -379,7 +475,9 @@ def impute_for_training(raw: RawSeries) -> RawSeries:
     from aqf.data.schema import LOCAL_FEATURE_COLS
 
     T, N, F = raw.local.shape
-    observed_mask = ~np.isnan(raw.local)
+    # Keep a mask assemble_real_raw_series already set (it knows which non-NaN cells are opencity
+    # estimates vs. proxies vs. real readings); only derive one from NaN-ness if there isn't one.
+    observed_mask = raw.local_observed_mask if raw.local_observed_mask is not None else ~np.isnan(raw.local)
     imputed = raw.local.copy()
 
     for n in range(N):

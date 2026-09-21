@@ -19,10 +19,18 @@ def main():
     p.add_argument("--ablation-suite", action="store_true", help="run experiments A-H instead of a single config")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--source", choices=["synthetic", "real"], default="synthetic")
+    p.add_argument("--stride", type=int, default=None, help="hours between window starts (default 6)")
+    p.add_argument("--hidden-dim", type=int, default=None)
     args = p.parse_args()
 
     cfg = Config(name=args.config)
     cfg.train.device = args.device
+    cfg.data.source = args.source
+    if args.stride:
+        cfg.data.stride_hours = args.stride
+    if args.hidden_dim:
+        cfg.model.hidden_dim = args.hidden_dim
     if args.epochs:
         cfg.train.epochs = args.epochs
 

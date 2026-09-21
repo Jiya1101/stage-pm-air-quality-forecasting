@@ -27,7 +27,7 @@ def main():
     model.load_state_dict(ckpt["model_state"])
 
     raw = load_raw(cfg)
-    split = make_split(raw, cfg.data, stride_hours=6, seed=cfg.train.seed)
+    split = make_split(raw, cfg.data, stride_hours=getattr(cfg.data, "stride_hours", 6), seed=cfg.train.seed)
     test_ds = AQFWindowDataset(raw, cfg.data, split.test_t0)
 
     report = evaluate(

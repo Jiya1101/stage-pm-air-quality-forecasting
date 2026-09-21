@@ -64,7 +64,10 @@ def forecast_loss(out: dict, batch: dict, station_mask: torch.Tensor, train_cfg:
     nll = (gaussian_nll(mean, logvar, y) * m).sum() / n_active
     mae = (F.l1_loss(mean, y, reduction="none") * m).sum() / n_active
     bce = (F.binary_cross_entropy(exceed_prob.clamp(1e-6, 1 - 1e-6), y_exceed, reduction="none") * m).sum() / n_active
-    return mae + lambda_nll * nll + 0.5 * bce, {"mae": mae.item(), "nll": nll.item(), "exceed_bce": bce.item()}
+    # MAE enters the loss in PM_SCALE-normalized units (like the NLL already did) so that every term --
+    # forecast, physics, source, regime -- is dimensionless and the lambdas mean what they say. The
+    # logged "mae" stays in real ug/m3 so training logs remain interpretable.
+    return mae / PM_SCALE + lambda_nll * nll + 0.5 * bce, {"mae": mae.item(), "nll": nll.item(), "exceed_bce": bce.item()}
 
 
 def physics_loss(physics: dict, station_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -73,9 +76,12 @@ def physics_loss(physics: dict, station_mask: torch.Tensor) -> tuple[torch.Tenso
     residual = physics["dCdt_pred"] - physics["dCdt_actual"]
     l_transport = ((residual ** 2) * m).sum() / m.sum().clamp(min=1) / residual.shape[0] / residual.shape[1]
 
-    total_dcdt = (physics["dCdt_actual"] * m).sum(dim=-1)          # (B, L)
-    total_ext = (physics["external_term"] * m).sum(dim=-1)
-    total_reaction = (physics["reaction_term"] * m).sum(dim=-1)
+    # Domain-MEAN mass budget (mean over active stations, not the sum): a sum makes the term grow as
+    # N_stations^2 once squared, so it would swamp the per-station transport residual by construction.
+    n_active = m.sum().clamp(min=1)
+    total_dcdt = (physics["dCdt_actual"] * m).sum(dim=-1) / n_active          # (B, L)
+    total_ext = (physics["external_term"] * m).sum(dim=-1) / n_active
+    total_reaction = (physics["reaction_term"] * m).sum(dim=-1) / n_active
     mass_residual = total_dcdt - (total_ext - total_reaction)
     l_mass = (mass_residual ** 2).mean()
 
