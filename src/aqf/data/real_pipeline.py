@@ -136,7 +136,26 @@ def _slice_legacy_cache(cache_dir: str, station_id: str, w_from: str, w_to: str)
     return None
 
 
-def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = None) -> pd.DataFrame:
+def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = None, cache_dir: str | None = "data/real/.firms_cache") -> pd.DataFrame:
+    """Cached wrapper: the ~345-request FIRMS pull takes 10-20 min, so a restart shouldn't repeat it.
+
+    The cache key is the date range. The last ~75 days come from the near-real-time product, which keeps
+    filling in, so delete data/real/.firms_cache if you need those days refreshed.
+    """
+    import os
+
+    cacheable = bool(cache_dir)
+    path = os.path.join(cache_dir, f"fep_{date_from}_{date_to}.parquet") if cacheable else None
+    if path and os.path.exists(path):
+        return pd.read_parquet(path)
+    df = _fetch_regional_fires_uncached(date_from, date_to, map_key)
+    if path and not df.empty:
+        os.makedirs(cache_dir, exist_ok=True)
+        df.to_parquet(path)
+    return df
+
+
+def _fetch_regional_fires_uncached(date_from: str, date_to: str, map_key: str | None = None) -> pd.DataFrame:
     """Real FIRMS pull, bucketed to REGIONAL_SOURCES and aggregated into hourly Fire Emission Proxy.
 
     Loops the Area API in <=5-day windows -- verified live: the documented
@@ -234,7 +253,30 @@ def _era5_chunks(kind: str, downloader, start: pd.Timestamp, end: pd.Timestamp, 
         return out
 
 
-def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir, max_workers: int = 6) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+# No PM2.5 exists for 2024 (OpenAQ gap, opencity.in ends 2023), so no train/val/test window ever reads
+# 2024 weather; skipping it saves ~a third of the Copernicus queue. Hours without ERA5 keep the
+# placeholder climatology in apply_era5_to_raw.
+ERA5_SKIP_RANGES = [("2024-01-01", "2024-12-31")]
+
+
+def _subtract_ranges(start: pd.Timestamp, end: pd.Timestamp, skips) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    pieces = [(start, end)]
+    for s_from, s_to in skips:
+        s_from, s_to = pd.Timestamp(s_from), pd.Timestamp(s_to)
+        nxt = []
+        for a, b in pieces:
+            if s_to < a or s_from > b:
+                nxt.append((a, b))
+                continue
+            if a < s_from:
+                nxt.append((a, s_from - pd.Timedelta(days=1)))
+            if b > s_to:
+                nxt.append((s_to + pd.Timedelta(days=1), b))
+        pieces = nxt
+    return pieces
+
+
+def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir, max_workers: int = 6, skip_ranges=ERA5_SKIP_RANGES) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Real ERA5 pull: domain-averaged atmos series, per-REGIONAL_SOURCES wind, and per-station local met.
 
     Starts from one request per calendar year and adaptively halves any
@@ -266,8 +308,9 @@ def fetch_era5(date_from: str, date_to: str, cache_dir: str = _era5_scratch_dir,
     for year in range(pd.Timestamp(date_from).year, pd.Timestamp(date_to).year + 1):
         y_start = max(pd.Timestamp(date_from), pd.Timestamp(f"{year}-01-01"))
         y_end = min(pd.Timestamp(date_to), pd.Timestamp(f"{year}-12-31"))
-        jobs.append(("single", download_era5, y_start, y_end))
-        jobs.append(("pressure925", download_era5_pressure_level, y_start, y_end))
+        for a, b in _subtract_ranges(y_start, y_end, skip_ranges):
+            jobs.append(("single", download_era5, a, b))
+            jobs.append(("pressure925", download_era5_pressure_level, a, b))
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(lambda j: (j[0], _era5_chunks(j[0], j[1], j[2], j[3], cache_dir)), jobs))
@@ -420,7 +463,10 @@ def assemble_real_raw_series(
         # OpenAQ's hourly-aggregate buckets are timestamped on the half-hour (e.g. ...T05:30:00Z),
         # not on the hour -- verified live. Round to the nearest hour before aligning to `index`,
         # or every value silently reindexes to NaN (caught exactly this: 0% coverage without it).
-        ts = pd.to_datetime(df["datetime"], utc=True).dt.round("h")
+        # Buckets are labelled by their *start* (e.g. 18:30 = 00:00 IST), so the bucket's centre is start+30min,
+        # which lands exactly on an hour. Do NOT use .round("h") on the raw label: pandas rounds exact
+        # half-hours to the nearest even hour, which merged adjacent buckets in pairs and left every odd hour empty.
+        ts = (pd.to_datetime(df["datetime"], utc=True) + pd.Timedelta(minutes=30)).dt.floor("h")
         df = df.set_index(ts).groupby(level=0).mean(numeric_only=True).reindex(index)
         for src_col, dst_idx in col_map.items():
             if src_col in df.columns:
