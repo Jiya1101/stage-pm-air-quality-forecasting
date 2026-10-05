@@ -34,11 +34,21 @@ class AblationFlags:
 class DataConfig:
     source: Literal["synthetic", "real"] = "synthetic"
     synthetic_dir: str = "data/synthetic"
-    real_dir: str = "data/real"
+    real_dir: str = "data/real_2022_2026"
+    # Synthetic data: split by calendar year.
     start_year: int = 2018
     train_end_year: int = 2021   # 2018-2021 -> train
     val_year: int = 2022         # 2022 -> val
     test_year: int = 2023        # 2023 -> test
+    # Real data: split by explicit date range (inclusive). OpenAQ/opencity.in leave a ~13-month hole
+    # (2024 to mid-Feb 2025) with no PM2.5 at all, so train (2022-23) and val/test (2025-26) are not adjacent;
+    # val starts a few days after OpenAQ resumes so its 48h lookback doesn't reach into the hole.
+    train_start: str = "2022-01-01"
+    train_end: str = "2023-12-31"
+    val_start: str = "2025-02-21"
+    val_end: str = "2025-08-31"
+    test_start: str = "2025-09-01"
+    test_end: str = "2026-09-20"
     lookback_hours: int = 48
     horizons_hours: tuple = (1, 6, 24)
     exceedance_threshold: float = 200.0  # CPCB "severe" PM2.5 threshold (ug/m3)

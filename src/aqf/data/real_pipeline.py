@@ -72,21 +72,68 @@ def fetch_local_stations(
         os.makedirs(cache_dir, exist_ok=True)
 
     out = {}
+    windows = _half_year_windows(date_from, date_to)
     for station in LOCAL_STATIONS:
-        cache_path = os.path.join(cache_dir, f"{station.id}_{date_from}_{date_to}.parquet") if cache_dir else None
-        if cache_path and os.path.exists(cache_path):
-            out[station.id] = pd.read_parquet(cache_path)
-            continue
-
         loc = matches.get(station.id)
-        if loc is None:
-            out[station.id] = pd.DataFrame()
-            continue
-        df = client.fetch_station_history(loc["id"], date_from, date_to)
-        out[station.id] = df
-        if cache_path:
-            df.to_parquet(cache_path)
+        frames = []
+        for w_from, w_to in windows:
+            cache_path = os.path.join(cache_dir, f"{station.id}_{w_from}_{w_to}.parquet") if cache_dir else None
+            if cache_path and os.path.exists(cache_path):
+                frames.append(pd.read_parquet(cache_path))
+                continue
+            legacy = _slice_legacy_cache(cache_dir, station.id, w_from, w_to) if cache_dir else None
+            if legacy is not None:
+                frames.append(legacy)
+                continue
+            if loc is None:
+                continue
+            df = client.fetch_station_history(loc["id"], w_from, w_to)
+            frames.append(df)
+            if cache_path:
+                df.to_parquet(cache_path)
+        frames = [f for f in frames if not f.empty]
+        out[station.id] = pd.concat(frames, ignore_index=True).sort_values("datetime") if frames else pd.DataFrame()
     return out
+
+
+def _half_year_windows(date_from: str, date_to: str) -> list[tuple[str, str]]:
+    """Calendar half-year windows clipped to [date_from, date_to].
+
+    OpenAQ's deep-pagination wall (~page 12 = ~500 days of hourly rows) would
+    otherwise silently drop the *end* of a long pull, which for a range ending
+    today is the most recent data. Half-years stay well under it, and
+    calendar-aligned windows line up with earlier cached pulls.
+    """
+    start, end = pd.Timestamp(date_from), pd.Timestamp(date_to)
+    out = []
+    cur = start
+    while cur <= end:
+        boundary = pd.Timestamp(cur.year, 6, 30) if cur.month <= 6 else pd.Timestamp(cur.year, 12, 31)
+        w_end = min(boundary, end)
+        out.append((cur.strftime("%Y-%m-%d"), w_end.strftime("%Y-%m-%d")))
+        cur = w_end + pd.Timedelta(days=1)
+    return out
+
+
+def _slice_legacy_cache(cache_dir: str, station_id: str, w_from: str, w_to: str) -> pd.DataFrame | None:
+    """Reuse an earlier whole-range cache file (e.g. DL001_2018-01-01_2023-12-31.parquet) that fully covers this window."""
+    import glob
+    import os
+
+    for path in glob.glob(os.path.join(cache_dir, f"{station_id}_*_*.parquet")):
+        stem = os.path.basename(path)[:-len(".parquet")]
+        try:
+            l_from, l_to = stem.split("_")[1:3]
+        except ValueError:
+            continue
+        if l_from <= w_from and l_to >= w_to and (l_from, l_to) != (w_from, w_to):
+            df = pd.read_parquet(path)
+            if df.empty:
+                return df
+            ts = pd.to_datetime(df["datetime"], utc=True)
+            keep = (ts >= pd.Timestamp(w_from, tz="UTC")) & (ts < pd.Timestamp(w_to, tz="UTC") + pd.Timedelta(days=1))
+            return df[keep.to_numpy()]
+    return None
 
 
 def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = None) -> pd.DataFrame:
@@ -108,8 +155,7 @@ def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = Non
     bbox = (73.0, 24.0, 79.5, 32.5)  # NCR_TRANSPORT_DOMAIN_BBOX, see firms.py
     DAY_RANGE = 5
 
-    is_historical = pd.Timestamp(date_to) < (pd.Timestamp.now() - pd.Timedelta(days=75))
-    source = HISTORICAL_SOURCE if is_historical else DEFAULT_SOURCE
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=75)  # chosen per window: a range ending today spans both products
 
     windows = pd.date_range(date_from, date_to, freq=f"{DAY_RANGE}D")
     if windows.empty or windows[-1] < pd.Timestamp(date_to):
@@ -117,6 +163,7 @@ def fetch_regional_fires(date_from: str, date_to: str, map_key: str | None = Non
 
     frames = []
     for end_date in windows:
+        source = HISTORICAL_SOURCE if end_date < cutoff else DEFAULT_SOURCE
         df = client.fetch_area(bbox, day_range=DAY_RANGE, date=end_date.strftime("%Y-%m-%d"), source=source)
         if not df.empty:
             frames.append(df)

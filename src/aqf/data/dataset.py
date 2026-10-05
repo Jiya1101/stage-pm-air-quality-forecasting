@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -42,17 +43,25 @@ class SplitIndices:
 
 
 def make_split(raw: RawSeries, cfg: DataConfig, stride_hours: int = 6, seed: int = 0) -> SplitIndices:
-    years = raw.timestamps.year.to_numpy()
     max_h = max(cfg.horizons_hours)
     lo = cfg.lookback_hours - 1
     hi = len(raw.timestamps) - max_h - 1
 
     all_t0 = np.arange(lo, hi, stride_hours)
-    t0_years = years[all_t0]
+    if cfg.source == "synthetic":
+        t0_years = raw.timestamps.year.to_numpy()[all_t0]
+        train_t0 = all_t0[(t0_years >= cfg.start_year) & (t0_years <= cfg.train_end_year)]
+        val_t0 = all_t0[t0_years == cfg.val_year]
+        test_t0 = all_t0[t0_years == cfg.test_year]
+    else:
+        t0_times = raw.timestamps[all_t0]
 
-    train_t0 = all_t0[t0_years <= cfg.train_end_year]
-    val_t0 = all_t0[t0_years == cfg.val_year]
-    test_t0 = all_t0[t0_years == cfg.test_year]
+        def in_range(start: str, end: str) -> np.ndarray:
+            return all_t0[(t0_times >= pd.Timestamp(start)) & (t0_times < pd.Timestamp(end) + pd.Timedelta(days=1))]
+
+        train_t0 = in_range(cfg.train_start, cfg.train_end)
+        val_t0 = in_range(cfg.val_start, cfg.val_end)
+        test_t0 = in_range(cfg.test_start, cfg.test_end)
 
     rng = np.random.default_rng(seed)
     n_local = raw.local.shape[1]
