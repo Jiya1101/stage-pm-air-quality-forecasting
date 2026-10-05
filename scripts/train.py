@@ -22,6 +22,7 @@ def main():
     p.add_argument("--source", choices=["synthetic", "real"], default="synthetic")
     p.add_argument("--stride", type=int, default=None, help="hours between window starts (default 6)")
     p.add_argument("--hidden-dim", type=int, default=None)
+    p.add_argument("--out-dir", default=None, help="where checkpoints/history go (default: runs)")
     args = p.parse_args()
 
     cfg = Config(name=args.config)
@@ -33,6 +34,8 @@ def main():
         cfg.model.hidden_dim = args.hidden_dim
     if args.epochs:
         cfg.train.epochs = args.epochs
+    if args.out_dir:
+        cfg.train.out_dir = args.out_dir
 
     if args.ablation_suite:
         results = run_suite(cfg)
