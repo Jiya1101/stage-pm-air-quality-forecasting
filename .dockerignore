@@ -1,0 +1,10 @@
+.git
+data
+runs
+docs
+tests
+scripts
+deploy_test
+**/__pycache__
+.env
+.cdsapirc

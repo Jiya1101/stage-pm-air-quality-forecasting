@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STAGE-PM Delhi PM2.5</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #1c2330; --muted: #657084; --line: #e2e6ec; --accent: #2b59c3;
+    --good: #2e9e5b; --sat: #8fb83a; --mod: #e0b21f; --poor: #e8801f; --vpoor: #d9453b; --sev: #8a2a6b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161d; --card: #1b212b; --ink: #e8ecf2; --muted: #98a3b5; --line: #2b3441; --accent: #7aa2ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .controls input[type=range] { flex: 1 1 260px; accent-color: var(--accent); }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; font: inherit; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  .stamp { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .stats { display: flex; gap: 22px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+  .stats b { color: var(--ink); }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover, tbody tr.sel { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .chip { display: inline-block; min-width: 54px; text-align: center; padding: 2px 8px; border-radius: 12px; color: #fff; font-weight: 600; }
+  .ci { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .act { color: var(--muted); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  h2 { font-size: 14px; margin: 0 0 8px; }
+  .bar { display: grid; grid-template-columns: 90px 1fr 44px; gap: 8px; align-items: center; font-size: 13px; margin: 4px 0; }
+  .bar i { display: block; height: 10px; border-radius: 5px; background: var(--accent); }
+  .bar span:last-child { text-align: right; color: var(--muted); }
+  svg text { fill: var(--muted); font-size: 11px; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>STAGE-PM &middot; Delhi-NCR PM2.5 forecast</h1>
+  <div class="sub">Physics-constrained, source-aware, multi-scale dynamic transport graph network &mdash; replay demo over stored hourly data</div>
+
+  <div class="card">
+    <div class="controls">
+      <button id="play">Play</button>
+      <input id="slider" type="range" min="0" max="0" value="0">
+      <span class="stamp" id="stamp">&hellip;</span>
+    </div>
+    <div class="stats" style="margin-top:10px">
+      <span>Model: <b id="model">&ndash;</b></span>
+      <span>Stability index S<sub>t</sub>: <b id="stab">&ndash;</b></span>
+      <span>Domain mean now: <b id="mean-now">&ndash;</b></span>
+    </div>
+  </div>
+
+  <div class="card scroll">
+    <table>
+      <thead><tr><th>Station</th><th>Now</th><th>+1 h</th><th>+6 h</th><th>+24 h</th><th>P(&gt;200)&nbsp;+24 h</th><th>Regime</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="grid">
+    <div class="card"><h2 id="trend-title">Observed PM2.5, previous 72 h</h2><svg id="trend" viewBox="0 0 520 190" width="100%"></svg></div>
+    <div class="card">
+      <h2 id="src-title">Source contribution</h2><div id="src"></div>
+      <h2 style="margin-top:14px">Regime probability</h2><div id="reg"></div>
+    </div>
+  </div>
+
+  <div class="note">
+    Values are &micro;g/m&sup3;. Bands follow the CPCB PM2.5 categories. &ldquo;actual&rdquo; is the sensor reading at the forecast time, shown only when a real reading exists.
+    This is a replay of held-out data, not a live feed. Source-contribution and regime outputs are learned heads;
+    they have no ground truth on real data and should be read as model outputs, not measurements.
+  </div>
+</div>
+
+<script>
+const COLORS = {"Good":"var(--good)","Satisfactory":"var(--sat)","Moderate":"var(--mod)","Poor":"var(--poor)","Very poor":"var(--vpoor)","Severe":"var(--sev)"};
+const $ = id => document.getElementById(id);
+let META, STEP_MS = 3600e3, selected = null, timer = null, last = null, reqId = 0;
+
+function chip(v, band) { return `<span class="chip" style="background:${COLORS[band]}">${Math.round(v)}</span>`; }
+// The regime head has no ground truth on real data, so only name a regime when it is clearly ahead of the rest.
+function regimeLabel(s) {
+  if (!s.regime) return "&ndash;";
+  const p = Object.values(s.regime.probs), top = Math.max(...p);
+  return top >= 0.5 ? s.regime.label.replace("_", " ") : "<span class='act'>unclear</span>";
+}
+function fmtTime(s) { return s.replace("T", " ").slice(0, 16) + " UTC"; }
+
+async function load(i) {
+  const t = new Date(Date.parse(META.first.replace(" ", "T") + "Z") + i * STEP_MS).toISOString();
+  const my = ++reqId;
+  const r = await fetch("/api/forecast?t=" + encodeURIComponent(t));
+  if (!r.ok) return;
+  const d = await r.json();
+  if (my !== reqId) return;  // a newer slider position superseded this response
+  last = d;
+  render(d);
+  if (selected) drawTrend(selected, d.issued_at);
+}
+
+function render(d) {
+  $("stamp").textContent = fmtTime(d.issued_at);
+  $("stab").textContent = d.stability_index.toFixed(2);
+  const mean = d.stations.reduce((a, s) => a + s.current_pm25, 0) / d.stations.length;
+  $("mean-now").textContent = Math.round(mean) + " µg/m³";
+  $("rows").innerHTML = d.stations.map(s => {
+    const cells = s.forecast.map(f =>
+      `<td>${chip(f.pm25, f.band)}<span class="ci">${Math.round(f.lo95)}–${Math.round(f.hi95)}</span>` +
+      (f.actual != null ? `<div class="act">actual ${Math.round(f.actual)}</div>` : "") + `</td>`).join("");
+    const p24 = s.forecast[s.forecast.length - 1].exceed_prob;
+    return `<tr data-id="${s.id}" class="${s.id === selected ? "sel" : ""}"><td>${s.name}</td>` +
+      `<td>${chip(s.current_pm25, s.current_band)}</td>${cells}<td>${(p24 * 100).toFixed(0)}%</td>` +
+      `<td>${regimeLabel(s)}</td></tr>`;
+  }).join("");
+  document.querySelectorAll("#rows tr").forEach(tr => tr.onclick = () => { selected = tr.dataset.id; render(last); drawTrend(selected, last.issued_at); });
+  if (selected) sideBars(d.stations.find(s => s.id === selected));
+}
+
+function sideBars(s) {
+  if (!s) return;
+  $("src-title").textContent = "Source contribution — " + s.name;
+  const bars = (obj) => obj ? Object.entries(obj).map(([k, v]) =>
+    `<div class="bar"><span>${k.replace("_", " ")}</span><i style="width:${Math.round(v * 100)}%"></i><span>${Math.round(v * 100)}%</span></div>`).join("") : "<span class='act'>not available in this model</span>";
+  $("src").innerHTML = bars(s.sources);
+  $("reg").innerHTML = bars(s.regime ? s.regime.probs : null);
+}
+
+async function drawTrend(id, end) {
+  const s = last.stations.find(x => x.id === id);
+  $("trend-title").textContent = "Observed PM2.5, previous 72 h — " + s.name;
+  sideBars(s);
+  const r = await fetch(`/api/series/${id}?hours=72&end=${encodeURIComponent(end)}`);
+  if (!r.ok || end !== last.issued_at) return;
+  const d = await r.json();
+  const W = 520, H = 190, L = 34, B = 22, T = 8, R = 8;
+  const max = Math.max(50, ...d.pm25) * 1.1, n = d.pm25.length;
+  const x = i => L + (W - L - R) * i / Math.max(n - 1, 1), y = v => T + (H - T - B) * (1 - v / max);
+  let g = "";
+  for (let k = 0; k <= 4; k++) { const v = max * k / 4; g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${L - 4}" y="${y(v) + 4}" text-anchor="end">${Math.round(v)}</text>`; }
+  let seg = "", path = "";
+  d.pm25.forEach((v, i) => { path += (i ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1); });
+  d.pm25.forEach((v, i) => { if (!d.observed[i]) seg += `<circle cx="${x(i)}" cy="${y(v)}" r="1.6" fill="var(--muted)"/>`; });
+  $("trend").innerHTML = g + `<path d="${path}" fill="none" stroke="var(--accent)" stroke-width="1.8"/>` + seg +
+    `<text x="${L}" y="${H - 6}">-72h</text><text x="${W - R}" y="${H - 6}" text-anchor="end">now</text>`;
+}
+
+async function init() {
+  META = await (await fetch("/api/meta")).json();
+  $("model").textContent = META.model;
+  $("slider").max = META.n_steps - 1;
+  $("slider").value = META.n_steps - 1;
+  $("slider").oninput = e => load(+e.target.value);
+  $("play").onclick = () => {
+    if (timer) { clearInterval(timer); timer = null; $("play").textContent = "Play"; return; }
+    $("play").textContent = "Pause";
+    timer = setInterval(() => {
+      const sl = $("slider"); sl.value = (+sl.value + 3) % (+sl.max + 1); load(+sl.value);
+    }, 900);
+  };
+  selected = META.stations[0].id;
+  load(META.n_steps - 1);
+}
+init();
+</script>
+</body>
+</html>

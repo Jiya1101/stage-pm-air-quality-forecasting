@@ -11,3 +11,6 @@ venv/
 # real-data credentials, never commit
 .cdsapirc
 .env
+
+# local test packaging of the deploy bundle
+/deploy_test/
