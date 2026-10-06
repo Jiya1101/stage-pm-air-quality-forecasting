@@ -12,7 +12,7 @@ import torch
 
 from aqf.data.dataset import AQFWindowDataset, make_split
 from aqf.evaluation.evaluate import evaluate
-from aqf.training.ablation import EXPERIMENTS
+from aqf.training.ablation import ALL_EXPERIMENTS
 from aqf.training.train import build_model, load_raw
 
 
@@ -21,10 +21,11 @@ def main():
     p.add_argument("--runs-dir", default="runs/real_suite")
     p.add_argument("--out", default=None, help="write a markdown table here")
     p.add_argument("--device", default="cpu")
+    p.add_argument("--variants", nargs="+", default=None, help="only these (default: every known variant found in --runs-dir)")
     args = p.parse_args()
 
     rows, raw_cache = {}, {}
-    for name in EXPERIMENTS:
+    for name in (args.variants or ALL_EXPERIMENTS):
         path = os.path.join(args.runs_dir, name, "best.pt")
         if not os.path.exists(path):
             continue

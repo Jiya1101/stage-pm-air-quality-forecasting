@@ -20,6 +20,7 @@ from torch import nn
 
 from aqf.config import AblationFlags, GraphConfig, ModelConfig
 from aqf.data.dataset import PM25_IDX
+from aqf.features.calendar import CALENDAR_FEATURE_COLS
 from aqf.losses.physics import PM_SCALE
 from aqf.graph.builder import DynamicGraphBuilder, StaticGraph
 from aqf.models.encoders import AtmosphericEncoder, LocalEncoder, SourceEncoder
@@ -51,7 +52,9 @@ class StagePM(nn.Module):
         self.graph_builder = DynamicGraphBuilder(self.static_tensors, graph_cfg, ablation)
 
         self.source_encoder = SourceEncoder(n_regional_features, D, model_cfg.dropout)
-        self.local_encoder = LocalEncoder(n_local_features, D, model_cfg.dropout)
+        self.use_calendar = getattr(ablation, "use_calendar", False)  # old checkpoints pickled without the flag
+        n_cal = len(CALENDAR_FEATURE_COLS) if self.use_calendar else 0
+        self.local_encoder = LocalEncoder(n_local_features + n_cal, D, model_cfg.dropout)
         self.atmos_encoder = AtmosphericEncoder(n_atmos_features, D, model_cfg.dropout)
 
         self.operator_layers = nn.ModuleList(
@@ -91,7 +94,11 @@ class StagePM(nn.Module):
         S_t_flat = S_t.reshape(B * L)
 
         h_R = self.source_encoder(regional_seq)   # (B, L, N_reg, D)
-        h_L = self.local_encoder(local_seq)        # (B, L, N_local, D)
+        local_in = local_seq
+        if self.use_calendar:  # same calendar row for every station
+            cal = batch["calendar_seq"].unsqueeze(2).expand(-1, -1, N_local, -1)
+            local_in = torch.cat([local_seq, cal], dim=-1)
+        h_L = self.local_encoder(local_in)         # (B, L, N_local, D)
 
         A_adv = self.graph_builder.local_adjacency(
             local_wind_unit.reshape(B * L, N_local, 2), S_t_flat

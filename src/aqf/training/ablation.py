@@ -76,6 +76,23 @@ EXPERIMENTS: dict[str, AblationFlags] = {
 }
 
 
+# Follow-ups to A-H: the same G / H models plus calendar inputs. Kept out of EXPERIMENTS so that
+# `--ablation-suite` still runs exactly the A-H ladder.
+EXTRA_EXPERIMENTS: dict[str, AblationFlags] = {
+    "G2_physics_calendar": AblationFlags(
+        use_wind_graph=True, use_blh=True, use_inversion=True, use_external_sources=True,
+        use_transport_lag=True, use_physics_loss=True, use_stability_gate=True,
+        use_source_head=False, use_regime_head=False, use_calendar=True,
+    ),
+    "H2_full_calendar": AblationFlags(
+        use_wind_graph=True, use_blh=True, use_inversion=True, use_external_sources=True,
+        use_transport_lag=True, use_physics_loss=True, use_stability_gate=True,
+        use_source_head=True, use_regime_head=True, use_calendar=True,
+    ),
+}
+ALL_EXPERIMENTS = {**EXPERIMENTS, **EXTRA_EXPERIMENTS}
+
+
 def build_experiment_configs(base_cfg: Config) -> dict[str, Config]:
     configs = {}
     for name, flags in EXPERIMENTS.items():

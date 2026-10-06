@@ -28,6 +28,7 @@ class AblationFlags:
     use_stability_gate: bool = True   # continuous S_t gating of edges (full model refinement)
     use_source_head: bool = True      # source contribution multi-task head
     use_regime_head: bool = True      # event-aware regime classifier
+    use_calendar: bool = False        # hour/weekday/season/Diwali inputs (aqf/features/calendar.py); off for A-H
 
 
 @dataclass

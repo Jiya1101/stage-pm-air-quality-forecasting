@@ -18,6 +18,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from aqf.features.calendar import calendar_features
+
 from aqf.config import DataConfig
 from aqf.data.schema import LOCAL_FEATURE_COLS, REGIONAL_FEATURE_COLS, RawSeries
 
@@ -81,6 +83,7 @@ class AQFWindowDataset(Dataset):
         self.cfg = cfg
         self.t0_indices = t0_indices
 
+        self.calendar = calendar_features(raw.timestamps)  # (T, F_cal), pure function of the timestamp
         self.local_wind_unit = _unit(raw.local[:, :, LOCAL_WIND_U_IDX], raw.local[:, :, LOCAL_WIND_V_IDX])
         self.regional_wind_unit = _unit(raw.regional[:, :, REG_WIND_U_IDX], raw.regional[:, :, REG_WIND_V_IDX])
         self.regional_wind_speed = np.sqrt(
@@ -117,6 +120,7 @@ class AQFWindowDataset(Dataset):
             "local_seq": torch.from_numpy(local_seq.astype(np.float32)),
             "regional_seq": torch.from_numpy(regional_seq.astype(np.float32)),
             "atmos_seq": torch.from_numpy(atmos_seq.astype(np.float32)),
+            "calendar_seq": torch.from_numpy(self.calendar[lo:t0 + 1]),
             "local_wind_unit_seq": torch.from_numpy(local_wind_unit_seq.astype(np.float32)),
             "regional_wind_unit_seq": torch.from_numpy(reg_wind_unit_seq.astype(np.float32)),
             "regional_wind_speed_seq": torch.from_numpy(reg_wind_speed_seq.astype(np.float32)),
