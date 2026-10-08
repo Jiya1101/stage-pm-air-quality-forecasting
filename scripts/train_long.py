@@ -22,16 +22,19 @@ def main():
     p.add_argument("--hidden-dim", type=int, default=32)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs/real_long")
+    p.add_argument("--freq-weighting", action="store_true", help="train with the frequency-weighted MAE")
+    p.add_argument("--name-suffix", default="", help="appended to the run name / output folder")
     args = p.parse_args()
 
     for name in args.variants:
-        cfg = Config(name=name)
+        cfg = Config(name=name + args.name_suffix)
         cfg.data.source = "real"
         cfg.data.stride_hours = args.stride
         cfg.model.hidden_dim = args.hidden_dim
         cfg.train.epochs = args.epochs
         cfg.train.seed = args.seed
         cfg.train.out_dir = args.out_dir
+        cfg.train.use_frequency_weighting = args.freq_weighting
         cfg.ablation = copy.deepcopy(ALL_EXPERIMENTS[name])
         print(f"\n=== {name} ({args.epochs} epochs) ===", flush=True)
         run(cfg)

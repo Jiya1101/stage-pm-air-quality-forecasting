@@ -43,7 +43,7 @@ def gaussian_nll(mean: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor)
     return 0.5 * (logvar + (target_n - mean_n) ** 2 / var_n)
 
 
-def forecast_loss(out: dict, batch: dict, station_mask: torch.Tensor, train_cfg: TrainConfig | None = None) -> tuple[torch.Tensor, dict]:
+def forecast_loss(out: dict, batch: dict, station_mask: torch.Tensor, train_cfg: TrainConfig | None = None, weight_fn=None) -> tuple[torch.Tensor, dict]:
     """station_mask: (N_local,) bool, True = included in loss (i.e. NOT held out).
 
     Combined with batch["y_observed"] (B, N_local, n_horizons) -- 1 where
@@ -62,12 +62,15 @@ def forecast_loss(out: dict, batch: dict, station_mask: torch.Tensor, train_cfg:
     n_active = m.sum().clamp(min=1)
 
     nll = (gaussian_nll(mean, logvar, y) * m).sum() / n_active
-    mae = (F.l1_loss(mean, y, reduction="none") * m).sum() / n_active
+    abs_err = F.l1_loss(mean, y, reduction="none")
+    mae = (abs_err * m).sum() / n_active  # logged value: always the plain MAE in ug/m3
+    # Optional frequency weighting (losses/frequency.py): weights depend only on the true target, average 1 over training.
+    mae_loss = ((abs_err * weight_fn(y) * m).sum() / n_active) if weight_fn is not None else mae
     bce = (F.binary_cross_entropy(exceed_prob.clamp(1e-6, 1 - 1e-6), y_exceed, reduction="none") * m).sum() / n_active
     # MAE enters the loss in PM_SCALE-normalized units (like the NLL already did) so that every term --
     # forecast, physics, source, regime -- is dimensionless and the lambdas mean what they say. The
     # logged "mae" stays in real ug/m3 so training logs remain interpretable.
-    return mae / PM_SCALE + lambda_nll * nll + 0.5 * bce, {"mae": mae.item(), "nll": nll.item(), "exceed_bce": bce.item()}
+    return mae_loss / PM_SCALE + lambda_nll * nll + 0.5 * bce, {"mae": mae.item(), "nll": nll.item(), "exceed_bce": bce.item()}
 
 
 def physics_loss(physics: dict, station_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -113,8 +116,8 @@ def regime_loss(out: dict, batch: dict, station_mask: torch.Tensor) -> torch.Ten
     return (ce * m).sum() / m.sum().clamp(min=1) / ce.shape[0]
 
 
-def total_loss(out: dict, batch: dict, train_cfg: TrainConfig, station_mask: torch.Tensor, use_physics: bool) -> tuple[torch.Tensor, dict]:
-    f_loss, f_log = forecast_loss(out, batch, station_mask, train_cfg)
+def total_loss(out: dict, batch: dict, train_cfg: TrainConfig, station_mask: torch.Tensor, use_physics: bool, weight_fn=None) -> tuple[torch.Tensor, dict]:
+    f_loss, f_log = forecast_loss(out, batch, station_mask, train_cfg, weight_fn)
     total = f_loss
     log = dict(f_log)
 

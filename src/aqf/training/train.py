@@ -75,6 +75,18 @@ def run(cfg: Config, verbose: bool = True) -> dict:
     out_dir = os.path.join(cfg.train.out_dir, cfg.name)
     os.makedirs(out_dir, exist_ok=True)
 
+    weight_fn = None
+    if cfg.train.use_frequency_weighting:
+        from aqf.losses.frequency import FrequencyWeights, collect_targets
+
+        train_y = collect_targets(raw, split.train_t0, cfg.data.horizons_hours, split.held_out_local_mask)
+        weight_fn = FrequencyWeights.fit(train_y, cfg.train.freq_alpha, cfg.train.freq_cap_quantile)
+        with open(os.path.join(out_dir, "frequency_weights.json"), "w") as f:
+            json.dump(weight_fn.info, f, indent=2)
+        if verbose:
+            print(f"[{cfg.name}] frequency weights fitted on {len(train_y)} training targets: "
+                  f"min {weight_fn.info['min_weight']:.2f}, max {weight_fn.info['max_weight']:.2f}", flush=True)
+
     history = {"train_loss": [], "val_mae": []}
     best_val = float("inf")
 
@@ -85,7 +97,7 @@ def run(cfg: Config, verbose: bool = True) -> dict:
         for batch in train_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             out = model(batch)
-            loss, log = total_loss(out, batch, cfg.train, station_mask, use_physics=cfg.ablation.use_physics_loss)
+            loss, log = total_loss(out, batch, cfg.train, station_mask, use_physics=cfg.ablation.use_physics_loss, weight_fn=weight_fn)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
