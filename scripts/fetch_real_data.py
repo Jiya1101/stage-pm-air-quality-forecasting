@@ -23,6 +23,8 @@ def main():
     p.add_argument("--start", default=None, help="YYYY-MM-DD")
     p.add_argument("--end", default=None, help="YYYY-MM-DD")
     p.add_argument("--out", default="data/real")
+    p.add_argument("--cpcb-dir", default=None, help="folder of hand-downloaded CPCB hourly CSVs (data/cpcb_files.py); "
+                   "replaces the OpenAQ + opencity.in station data")
     args = p.parse_args()
 
     if args.days:
@@ -36,7 +38,7 @@ def main():
 
     print(f"Fetching real STAGE-PM data from {date_from} to {date_to} "
           f"(OpenAQ for local stations, FIRMS for regional fires)...")
-    raw = assemble_real_raw_series(date_from, date_to)
+    raw = assemble_real_raw_series(date_from, date_to, cpcb_dir=args.cpcb_dir)
 
     os.makedirs(args.out, exist_ok=True)
     out_path = os.path.join(args.out, "raw.npz")

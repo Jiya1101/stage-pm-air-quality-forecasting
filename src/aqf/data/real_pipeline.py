@@ -253,10 +253,9 @@ def _era5_chunks(kind: str, downloader, start: pd.Timestamp, end: pd.Timestamp, 
         return out
 
 
-# No PM2.5 exists for 2024 (OpenAQ gap, opencity.in ends 2023), so no train/val/test window ever reads
-# 2024 weather; skipping it saves ~a third of the Copernicus queue. Hours without ERA5 keep the
-# placeholder climatology in apply_era5_to_raw.
-ERA5_SKIP_RANGES = [("2024-01-01", "2024-12-31")]
+# Hours to leave out of the ERA5 pull. Empty now that direct CPCB files give PM2.5 for 2024 as well; it was
+# [("2024-01-01", "2024-12-31")] while 2024 had no PM2.5 anywhere (OpenAQ gap, opencity.in ends 2023).
+ERA5_SKIP_RANGES: list[tuple[str, str]] = []
 
 
 def _subtract_ranges(start: pd.Timestamp, end: pd.Timestamp, skips) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
@@ -425,6 +424,7 @@ def assemble_real_raw_series(
     firms_map_key: str | None = None,
     use_era5: bool = True,
     use_opencity_fallback: bool = True,
+    cpcb_dir: str | None = None,
 ) -> RawSeries:
     """Build a RawSeries from live OpenAQ + FIRMS (+ ERA5, + opencity.in) data.
 
@@ -452,39 +452,47 @@ def assemble_real_raw_series(
     index = _hourly_index(date_from, date_to)
     T, N_local, N_reg = len(index), len(LOCAL_STATIONS), len(REGIONAL_SOURCES)
 
-    local_raw = fetch_local_stations(date_from, date_to, api_key=openaq_api_key)
-    local = np.full((T, N_local, len(LOCAL_FEATURE_COLS)), np.nan, dtype=np.float32)
-    real_observed = np.zeros((T, N_local, len(LOCAL_FEATURE_COLS)), dtype=bool)
-    col_map = {"pm25": 0, "pm10": 1, "no2": 2, "co": 3, "o3": 4, "temperature": 5, "relativehumidity": 6}
-    for i, station in enumerate(LOCAL_STATIONS):
-        df = local_raw.get(station.id, pd.DataFrame())
-        if df.empty:
-            continue
-        # OpenAQ's hourly-aggregate buckets are timestamped on the half-hour (e.g. ...T05:30:00Z),
-        # not on the hour -- verified live. Round to the nearest hour before aligning to `index`,
-        # or every value silently reindexes to NaN (caught exactly this: 0% coverage without it).
-        # Buckets are labelled by their *start* (e.g. 18:30 = 00:00 IST), so the bucket's centre is start+30min,
-        # which lands exactly on an hour. Do NOT use .round("h") on the raw label: pandas rounds exact
-        # half-hours to the nearest even hour, which merged adjacent buckets in pairs and left every odd hour empty.
-        ts = (pd.to_datetime(df["datetime"], utc=True) + pd.Timedelta(minutes=30)).dt.floor("h")
-        df = df.set_index(ts).groupby(level=0).mean(numeric_only=True).reindex(index)
-        for src_col, dst_idx in col_map.items():
-            if src_col in df.columns:
-                local[:, i, dst_idx] = df[src_col].to_numpy()
-                real_observed[:, i, dst_idx] = ~np.isnan(local[:, i, dst_idx])
-        if "wind_speed" in df.columns and "wind_direction" in df.columns:
-            speed = df["wind_speed"].to_numpy()
-            angle = np.radians(df["wind_direction"].to_numpy())
-            local[:, i, 7] = -speed * np.sin(angle)  # wind_u_ms (blowing toward, meteorological convention)
-            local[:, i, 8] = -speed * np.cos(angle)  # wind_v_ms
-            real_observed[:, i, 7] = ~np.isnan(local[:, i, 7])
-            real_observed[:, i, 8] = ~np.isnan(local[:, i, 8])
-        # traffic_index (col 9): no free real-time traffic-count source wired in yet -- diurnal proxy.
-        hour = index.hour.to_numpy()
-        local[:, i, 9] = 50 + 40 * np.clip(np.sin(2 * np.pi * (hour - 9) / 24), 0, None)
+    if cpcb_dir:
+        # Direct hourly station files from the CPCB portal (see data/cpcb_files.py): measured PM2.5/PM10/gases/met,
+        # no AQI-derived estimates, no OpenAQ coverage hole.
+        from aqf.data.cpcb_files import build_local_array
 
-    if use_opencity_fallback:
-        _fill_pm25_from_opencity(local, real_observed, index, date_from, date_to)
+        local, real_observed = build_local_array(cpcb_dir, index, len(LOCAL_FEATURE_COLS))
+    else:
+        local_raw = fetch_local_stations(date_from, date_to, api_key=openaq_api_key)
+        local = np.full((T, N_local, len(LOCAL_FEATURE_COLS)), np.nan, dtype=np.float32)
+        real_observed = np.zeros((T, N_local, len(LOCAL_FEATURE_COLS)), dtype=bool)
+        col_map = {"pm25": 0, "pm10": 1, "no2": 2, "co": 3, "o3": 4, "temperature": 5, "relativehumidity": 6}
+        for i, station in enumerate(LOCAL_STATIONS):
+            df = local_raw.get(station.id, pd.DataFrame())
+            if df.empty:
+                continue
+            # OpenAQ's hourly-aggregate buckets are timestamped on the half-hour (e.g. ...T05:30:00Z),
+            # not on the hour -- verified live. Round to the nearest hour before aligning to `index`,
+            # or every value silently reindexes to NaN (caught exactly this: 0% coverage without it).
+            # Buckets are labelled by their *start* (e.g. 18:30 = 00:00 IST), so the bucket's centre is start+30min,
+            # which lands exactly on an hour. Do NOT use .round("h") on the raw label: pandas rounds exact
+            # half-hours to the nearest even hour, which merged adjacent buckets in pairs and left every odd hour empty.
+            ts = (pd.to_datetime(df["datetime"], utc=True) + pd.Timedelta(minutes=30)).dt.floor("h")
+            df = df.set_index(ts).groupby(level=0).mean(numeric_only=True).reindex(index)
+            for src_col, dst_idx in col_map.items():
+                if src_col in df.columns:
+                    local[:, i, dst_idx] = df[src_col].to_numpy()
+                    real_observed[:, i, dst_idx] = ~np.isnan(local[:, i, dst_idx])
+            if "wind_speed" in df.columns and "wind_direction" in df.columns:
+                speed = df["wind_speed"].to_numpy()
+                angle = np.radians(df["wind_direction"].to_numpy())
+                local[:, i, 7] = -speed * np.sin(angle)  # wind_u_ms (blowing toward, meteorological convention)
+                local[:, i, 8] = -speed * np.cos(angle)  # wind_v_ms
+                real_observed[:, i, 7] = ~np.isnan(local[:, i, 7])
+                real_observed[:, i, 8] = ~np.isnan(local[:, i, 8])
+            # traffic_index (col 9): no free real-time traffic-count source wired in yet -- diurnal proxy.
+            hour = index.hour.to_numpy()
+            local[:, i, 9] = 50 + 40 * np.clip(np.sin(2 * np.pi * (hour - 9) / 24), 0, None)
+
+        if use_opencity_fallback:
+            _fill_pm25_from_opencity(local, real_observed, index, date_from, date_to)
+
 
     regional_fep = fetch_regional_fires(date_from, date_to, map_key=firms_map_key)
     regional = np.zeros((T, N_reg, len(REGIONAL_FEATURE_COLS)), dtype=np.float32)

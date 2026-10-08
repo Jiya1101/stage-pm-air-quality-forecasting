@@ -35,17 +35,17 @@ class AblationFlags:
 class DataConfig:
     source: Literal["synthetic", "real"] = "synthetic"
     synthetic_dir: str = "data/synthetic"
-    real_dir: str = "data/real_2022_2026"
+    real_dir: str = "data/real_cpcb"
     # Synthetic data: split by calendar year.
     start_year: int = 2018
     train_end_year: int = 2021   # 2018-2021 -> train
     val_year: int = 2022         # 2022 -> val
     test_year: int = 2023        # 2023 -> test
-    # Real data: split by explicit date range (inclusive). OpenAQ/opencity.in leave a ~13-month hole
-    # (2024 to mid-Feb 2025) with no PM2.5 at all, so train (2022-23) and val/test (2025-26) are not adjacent;
-    # val starts a few days after OpenAQ resumes so its 48h lookback doesn't reach into the hole.
+    # Real data: split by explicit date range (inclusive). Direct CPCB station files cover 2022 to Sep 2026 without a
+    # hole, so train runs 2022 -> mid Feb 2025 (three crop-burning seasons); val starts a few days later so its 48h
+    # lookback doesn't reach into training data.
     train_start: str = "2022-01-01"
-    train_end: str = "2023-12-31"
+    train_end: str = "2025-02-14"
     val_start: str = "2025-02-21"
     val_end: str = "2025-08-31"
     test_start: str = "2025-09-01"
@@ -90,6 +90,9 @@ class TrainConfig:
     lambda_regime: float = 0.1
     lambda_nll: float = 0.05
     grad_clip: float = 5.0
+    use_frequency_weighting: bool = False  # frequency-weighted MAE (losses/frequency.py); off = the loss used so far
+    freq_alpha: float = 0.5                # softening of the inverse-frequency weights (1 = pure inverse, 0 = none)
+    freq_cap_quantile: float = 0.99        # weights are capped at this quantile of the training weights
     device: str = "cpu"
     seed: int = 0
     out_dir: str = "runs"
