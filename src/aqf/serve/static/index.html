@@ -44,6 +44,10 @@
   .bar span:last-child { text-align: right; color: var(--muted); }
   svg text { fill: var(--muted); font-size: 11px; }
   .note { font-size: 12px; color: var(--muted); margin-top: 18px; }
+  .mini th, .mini td { padding: 5px 8px; font-size: 13px; }
+  .badge { display: inline-block; padding: 1px 8px; margin: 0 6px 4px 0; border-radius: 10px; border: 1px solid var(--line); font-size: 12px; }
+  .badge.on { border-color: var(--good); color: var(--good); }
+  #fb-msg { margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -76,6 +80,23 @@
     <div class="card">
       <h2 id="src-title">Source contribution</h2><div id="src"></div>
       <h2 style="margin-top:14px">Regime probability</h2><div id="reg"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Cloud pipeline</h2>
+    <div id="cloud-info" class="act">Loading cloud status&hellip;</div>
+    <div class="scroll" style="margin-top:10px">
+      <table class="mini">
+        <thead><tr><th>Stored forecast (issued at)</th><th>Mean now</th><th>Stations &gt; 200 now</th><th>Max P(&gt;200) at +24 h</th></tr></thead>
+        <tbody id="hist-rows"></tbody>
+      </table>
+    </div>
+    <div style="margin-top:12px">
+      Was the forecast on screen useful?
+      <button id="fb-up" type="button">Useful</button>
+      <button id="fb-down" type="button" class="ghost">Not useful</button>
+      <span id="fb-msg" class="act"></span>
     </div>
   </div>
 
@@ -158,6 +179,34 @@ async function drawTrend(id, end) {
     `<text x="${L}" y="${H - 6}">-72h</text><text x="${W - R}" y="${H - 6}" text-anchor="end">now</text>`;
 }
 
+// ---- cloud pipeline panel: which services are active, stored forecasts, feedback ----
+const esc = s => String(s).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+async function loadCloud() {
+  try {
+    const [c, h] = await Promise.all([fetch("/api/cloud").then(r => r.json()), fetch("/api/history?limit=12").then(r => r.json())]);
+    const b = (on, text) => `<span class="badge ${on ? "on" : ""}">${esc(text)}</span>`;
+    $("cloud-info").innerHTML =
+      b(c.platform !== "local", "Platform: " + c.platform + (c.revision ? " (" + c.revision + ")" : "")) +
+      b(c.model_source !== "bundled", "Model from: " + (c.model_source === "bundled" ? "bundled file" : "Cloud Storage")) +
+      b(c.store === "firestore", "History in: " + (c.store === "firestore" ? "Firestore" : "memory (local)")) +
+      b(!!c.snapshot_bucket, "Snapshot bucket: " + (c.snapshot_bucket || "off")) +
+      b(c.job_endpoint_enabled, "Hourly job: " + (c.job_endpoint_enabled ? "key-protected" : "off"));
+    $("hist-rows").innerHTML = h.items.length
+      ? h.items.map(d => `<tr><td>${esc(d.issued_at.replace("T", " ").replace("Z", " UTC"))}</td><td>${d.mean_now}</td><td>${d.n_over_200_now}</td><td>${Math.round(100 * d.max_p_exceed_24h)}%</td></tr>`).join("")
+      : "<tr><td colspan='4' class='act'>No stored forecasts yet. The scheduled job stores one each hour.</td></tr>";
+  } catch (e) { $("cloud-info").textContent = "Cloud status unavailable."; }
+}
+async function sendFeedback(rating) {
+  if (!last) return;
+  try {
+    const r = await fetch("/api/feedback", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ issued_at: last.issued_at, rating, station_id: selected || null }) });
+    $("fb-msg").textContent = r.ok ? "Thanks, saved." : (r.status === 429 ? "Too many messages, wait a minute." : "Could not save.");
+  } catch (e) { $("fb-msg").textContent = "Could not save."; }
+}
+$("fb-up").onclick = () => sendFeedback("useful");
+$("fb-down").onclick = () => sendFeedback("not_useful");
+
 async function init() {
   META = await (await fetch("/api/meta")).json();
   $("model").textContent = META.model;
@@ -173,6 +222,8 @@ async function init() {
   };
   selected = META.stations[0].id;
   load(META.n_steps - 1);
+  loadCloud();
+  setInterval(loadCloud, 60000);
 }
 init();
 </script>

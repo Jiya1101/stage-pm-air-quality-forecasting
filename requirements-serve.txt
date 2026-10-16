@@ -1,8 +1,10 @@
 # Runtime dependencies for the Cloud Run image (inference only -- no training, no data fetching).
 # torch is installed separately from the CPU wheel index in the Dockerfile.
+# scipy and pyarrow are deliberately absent: the service runs without them (checked by blocking both imports).
 numpy>=1.26
 pandas>=2.1
-scipy>=1.11
-pyarrow>=14.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
+# Google Cloud client libraries, imported lazily by aqf/serve/cloud.py only when a cloud feature is switched on.
+google-cloud-storage>=2.16
+google-cloud-firestore>=2.16

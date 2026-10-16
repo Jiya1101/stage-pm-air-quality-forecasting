@@ -1,0 +1,27 @@
+# Cloud Build pipeline: build the container, push it to Artifact Registry, deploy it to Cloud Run.
+# Used by a Cloud Build trigger on pushes to main (see docs/DEPLOY.md). Manual run:
+#   gcloud builds submit --config cloudbuild.yaml --substitutions=SHORT_SHA=manual .
+# The deploy step passes only --image, so the service keeps the settings already on it
+# (service account, secret, environment variables, memory, instance limits).
+substitutions:
+  _REGION: us-central1
+  _REPO: stage-pm
+  _SERVICE: stage-pm
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${SHORT_SHA}", "."]
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${SHORT_SHA}"]
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args: ["run", "deploy", "${_SERVICE}", "--image", "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${SHORT_SHA}", "--region", "${_REGION}"]
+
+images:
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${SHORT_SHA}"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -79,9 +79,17 @@ class Predictor:
         return int(np.clip(idx, self.first_idx, self.last_idx))
 
     # ---- forecast ----
-    @torch.no_grad()
     def forecast(self, when: str | None = None) -> dict:
-        idx = self.index_for(when)
+        return self.forecast_at(self.index_for(when))
+
+    @property
+    def n_steps(self) -> int:
+        return self.last_idx - self.first_idx + 1
+
+    @torch.no_grad()
+    def forecast_at(self, idx: int) -> dict:
+        """Forecast issued at step `idx` of the replay data (clamped to the valid range)."""
+        idx = int(np.clip(idx, self.first_idx, self.last_idx))
         sample = self.ds[idx - self.first_idx]
         batch = {k: v.unsqueeze(0).to(self.device) for k, v in sample.items()}
         out = self.model(batch)
