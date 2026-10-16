@@ -68,6 +68,20 @@ class StagePM(nn.Module):
 
         self.scalar_physics = ScalarADRPhysics()
 
+        # Information about the forecast period itself (built last, so every module above initialises exactly as in the baseline).
+        self.use_future_weather = getattr(ablation, "use_future_weather", False)
+        self.use_future_calendar = getattr(ablation, "use_future_calendar", False)
+        n_future = 0
+        if self.use_future_weather:
+            n_future += model_cfg.future_steps * n_atmos_features
+        if self.use_future_calendar:
+            n_future += n_horizons * len(CALENDAR_FEATURE_COLS)
+        self.future_net = None
+        if n_future:
+            self.future_net = nn.Sequential(nn.Linear(n_future, D), nn.GELU(), nn.Linear(D, D))
+            nn.init.zeros_(self.future_net[-1].weight)  # starts out as the baseline model, then learns to use the extra input
+            nn.init.zeros_(self.future_net[-1].bias)
+
     def _masked_atmos(self, atmos_seq: torch.Tensor) -> torch.Tensor:
         """Ablation: zero out BLH / inversion-strength columns when their flag is off, per config.DataConfig ATMOS_FEATURE_COLS order."""
         if self.ablation.use_blh and self.ablation.use_inversion:
@@ -125,6 +139,13 @@ class StagePM(nn.Module):
 
         h_seq = h.permute(0, 2, 1, 3)  # (B, N_local, L, D)
         z = self.temporal(h_seq)        # (B, N_local, D)
+        if self.future_net is not None:
+            parts = []
+            if self.use_future_weather:
+                parts.append(batch["future_atmos"].flatten(1))        # (B, future_steps * F_atmos)
+            if self.use_future_calendar:
+                parts.append(batch["future_calendar"].flatten(1))     # (B, n_horizons * F_cal)
+            z = z + self.future_net(torch.cat(parts, dim=-1)).unsqueeze(1)  # same city-wide context for every station
 
         out = self.forecast_head(z, last=local_seq[:, -1, :, PM25_IDX])  # residual on the last reading
         if self.source_head is not None:

@@ -84,6 +84,11 @@ class AQFWindowDataset(Dataset):
         self.t0_indices = t0_indices
 
         self.calendar = calendar_features(raw.timestamps)  # (T, F_cal), pure function of the timestamp
+        # Standardise the weather fed in as "future weather" with statistics from the first 60% of the series only
+        # (the training period), so nothing about the validation/test weather leaks into the scaling.
+        n_fit = int(0.6 * len(raw.timestamps))
+        self.atmos_mu = raw.atmos[:n_fit].mean(axis=0)
+        self.atmos_sd = raw.atmos[:n_fit].std(axis=0) + 1e-6
         self.local_wind_unit = _unit(raw.local[:, :, LOCAL_WIND_U_IDX], raw.local[:, :, LOCAL_WIND_V_IDX])
         self.regional_wind_unit = _unit(raw.regional[:, :, REG_WIND_U_IDX], raw.regional[:, :, REG_WIND_V_IDX])
         self.regional_wind_speed = np.sqrt(
@@ -129,6 +134,14 @@ class AQFWindowDataset(Dataset):
             "y_observed": torch.from_numpy(y_observed),
             "t0": torch.tensor(t0, dtype=torch.long),
         }
+
+        # Information about the forecast period itself (only read by models with use_future_weather / use_future_calendar).
+        # future_atmos is the real ERA5 weather for t0+1 .. t0+max(horizon): a perfect forecast, so a test of how much
+        # future weather could help, not a number a deployed system could reach. future_calendar needs no forecast.
+        max_h = max(horizons)
+        fut = (self.raw.atmos[t0 + 1:t0 + 1 + max_h] - self.atmos_mu) / self.atmos_sd
+        sample["future_atmos"] = torch.from_numpy(np.clip(fut, -5, 5).astype(np.float32))              # (max_h, F_atmos)
+        sample["future_calendar"] = torch.from_numpy(self.calendar[[t0 + h for h in horizons]])         # (n_horizons, F_cal)
 
         if self.raw.source_contrib_gt is not None:
             sample["y_source_contrib"] = torch.from_numpy(

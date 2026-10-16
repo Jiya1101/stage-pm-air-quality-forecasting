@@ -29,6 +29,8 @@ class AblationFlags:
     use_source_head: bool = True      # source contribution multi-task head
     use_regime_head: bool = True      # event-aware regime classifier
     use_calendar: bool = False        # hour/weekday/season/Diwali inputs (aqf/features/calendar.py); off for A-H
+    use_future_weather: bool = False  # the weather over the forecast period as an input (test only: real ERA5 = a perfect forecast)
+    use_future_calendar: bool = False  # the calendar at each forecast time (hour, weekday, Diwali): knowable in advance
 
 
 @dataclass
@@ -75,6 +77,7 @@ class ModelConfig:
     dropout: float = 0.1
     n_source_categories: int = 5   # traffic, industry, biomass, dust, background
     n_regimes: int = 4             # Normal, Inversion, Biomass Burning, Dust
+    future_steps: int = 24         # hours of future weather fed to the model when use_future_weather is on
 
 
 @dataclass

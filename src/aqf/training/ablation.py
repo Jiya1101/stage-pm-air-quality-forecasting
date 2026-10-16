@@ -89,6 +89,23 @@ EXTRA_EXPERIMENTS: dict[str, AblationFlags] = {
         use_transport_lag=True, use_physics_loss=True, use_stability_gate=True,
         use_source_head=True, use_regime_head=True, use_calendar=True,
     ),
+    # Information about the forecast period, on top of the full model H. Future weather is the real ERA5 weather, i.e. a
+    # perfect forecast: an upper bound on what a weather forecast could add, not a deployable number.
+    "HF_future_weather": AblationFlags(
+        use_wind_graph=True, use_blh=True, use_inversion=True, use_external_sources=True,
+        use_transport_lag=True, use_physics_loss=True, use_stability_gate=True,
+        use_source_head=True, use_regime_head=True, use_future_weather=True,
+    ),
+    "HC_future_calendar": AblationFlags(
+        use_wind_graph=True, use_blh=True, use_inversion=True, use_external_sources=True,
+        use_transport_lag=True, use_physics_loss=True, use_stability_gate=True,
+        use_source_head=True, use_regime_head=True, use_future_calendar=True,
+    ),
+    "HFC_future_weather_calendar": AblationFlags(
+        use_wind_graph=True, use_blh=True, use_inversion=True, use_external_sources=True,
+        use_transport_lag=True, use_physics_loss=True, use_stability_gate=True,
+        use_source_head=True, use_regime_head=True, use_future_weather=True, use_future_calendar=True,
+    ),
 }
 ALL_EXPERIMENTS = {**EXPERIMENTS, **EXTRA_EXPERIMENTS}
 
